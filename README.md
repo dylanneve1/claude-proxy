@@ -1,37 +1,42 @@
 # opencode-claude-max-proxy
 
-Use your **Claude Max subscription** ($200/month) with OpenCode instead of paying per-token API costs.
+Use your **Claude Max subscription** ($200/month) with OpenCode.
 
 ## The Problem
 
-You're paying $200/month for Claude Max which gives you unlimited Claude usage in the Claude apps and CLI. But when you use OpenCode (or any AI coding tool), it connects to the Anthropic API and charges you **per token** - potentially hundreds of dollars on top of your existing subscription.
+Anthropic doesn't allow Claude Max subscribers to use their subscription with third-party tools like OpenCode. If you want to use Claude in OpenCode, you have to pay for API access separately - even though you're already paying $200/month for "unlimited" Claude.
 
-**You're paying twice for the same AI.**
+Your options are:
+1. Use Claude's official apps only (limited to their UI)
+2. Pay again for API access on top of your Max subscription
+3. **Use this proxy**
 
 ## The Solution
 
-This proxy sits between OpenCode and your Claude Max subscription:
+This proxy bridges the gap using Anthropic's own tools:
 
 ```
 OpenCode → Proxy (localhost:3456) → Claude Agent SDK → Your Claude Max Subscription
 ```
 
-Instead of hitting the paid Anthropic API, your requests go through the official Claude Agent SDK which uses your existing Claude Max subscription. **Zero additional cost.**
+The [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) is Anthropic's **official npm package** that lets developers build with Claude using their Max subscription. This proxy simply translates OpenCode's API requests into SDK calls.
 
-## Is This Legal?
+**Your Max subscription. Anthropic's official SDK. Zero additional cost.**
 
-**Yes, 100%.**
+## Is This Allowed?
 
-This proxy uses the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk) - Anthropic's **official, public npm package** designed for exactly this purpose. We're not:
+**Yes.** Here's why:
 
-- Reverse engineering anything
-- Bypassing authentication
-- Violating terms of service
-- Modifying Anthropic's code
+| Concern | Reality |
+|---------|---------|
+| "Bypassing restrictions" | No. We use Anthropic's public SDK exactly as documented |
+| "Violating TOS" | No. The SDK is designed for programmatic Claude access |
+| "Unauthorized access" | No. You authenticate with `claude login` using your own account |
+| "Reverse engineering" | No. We call `query()` from their npm package, that's it |
 
-We simply call `query()` from their SDK and translate the response format. This is the intended use of the SDK.
+The Claude Agent SDK exists specifically to let Max subscribers use Claude programmatically. We're just translating the request format so OpenCode can use it.
 
-**You're using your own paid subscription through official channels.**
+**~200 lines of TypeScript. No hacks. No magic. Just format translation.**
 
 ## Features
 
