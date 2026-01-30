@@ -81,7 +81,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         let fullContent = ""
         const response = query({
           prompt,
-          options: { maxTurns: 1, model, pathToClaudeCodeExecutable: claudeExecutable }
+          options: {
+            maxTurns: 1,
+            model,
+            pathToClaudeCodeExecutable: claudeExecutable,
+            tools: []
+          }
         })
 
         for await (const message of response) {
@@ -120,7 +125,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 maxTurns: 1,
                 model,
                 pathToClaudeCodeExecutable: claudeExecutable,
-                includePartialMessages: true
+                includePartialMessages: true,
+                tools: [],
+                systemPrompt: "You are a helpful assistant. Respond directly to the user's message with text only. Do not attempt to use any tools."
               }
             })
 
