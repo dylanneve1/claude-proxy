@@ -622,25 +622,111 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   // Translates OpenAI ChatCompletion format to/from Anthropic Messages API
   // so tools expecting OpenAI endpoints (LangChain, LiteLLM, etc.) just work.
 
+  function convertOpenaiContent(content: any): any {
+    // String content → pass through
+    if (typeof content === "string") return content
+    if (!Array.isArray(content)) return String(content ?? "")
+
+    // Array content → convert image_url parts to Anthropic image blocks
+    return content.map((part: any) => {
+      if (part.type === "text") return { type: "text", text: part.text ?? "" }
+      if (part.type === "image_url" && part.image_url?.url) {
+        const url = part.image_url.url as string
+        // Data URL: data:image/jpeg;base64,...
+        const dataMatch = url.match(/^data:(image\/\w+);base64,(.+)$/)
+        if (dataMatch) {
+          return {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: dataMatch[1]!,
+              data: dataMatch[2]!
+            }
+          }
+        }
+        // HTTP URL — pass as URL source
+        return {
+          type: "image",
+          source: { type: "url", url }
+        }
+      }
+      return part
+    })
+  }
+
   function openaiToAnthropicMessages(messages: any[]): { system?: string; messages: any[] } {
     let system: string | undefined
     const converted: any[] = []
 
     for (const msg of messages) {
       if (msg.role === "system") {
-        system = (system ? system + "\n" : "") + (msg.content ?? "")
-      } else if (msg.role === "user" || msg.role === "assistant") {
-        converted.push({ role: msg.role, content: msg.content ?? "" })
+        system = (system ? system + "\n" : "") + (typeof msg.content === "string" ? msg.content : "")
+      } else if (msg.role === "user") {
+        converted.push({ role: "user", content: convertOpenaiContent(msg.content) })
+      } else if (msg.role === "assistant") {
+        // Handle assistant messages with tool_calls (OpenAI format)
+        if (msg.tool_calls?.length) {
+          const content: any[] = []
+          if (msg.content) content.push({ type: "text", text: msg.content })
+          for (const tc of msg.tool_calls) {
+            content.push({
+              type: "tool_use",
+              id: tc.id,
+              name: tc.function?.name ?? "",
+              input: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}
+            })
+          }
+          converted.push({ role: "assistant", content })
+        } else {
+          converted.push({ role: "assistant", content: msg.content ?? "" })
+        }
+      } else if (msg.role === "tool") {
+        // OpenAI tool result → Anthropic tool_result
+        converted.push({
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: msg.tool_call_id,
+            content: msg.content ?? ""
+          }]
+        })
       }
     }
     return { system, messages: converted }
   }
 
-  function anthropicToOpenaiResponse(anthropicBody: any, model: string, stream: boolean): any {
-    const text = anthropicBody.content
-      ?.filter((b: any) => b.type === "text")
-      .map((b: any) => b.text)
-      .join("") || ""
+  function openaiToAnthropicTools(tools: any[]): any[] {
+    return tools
+      .filter((t: any) => t.type === "function" && t.function)
+      .map((t: any) => ({
+        name: t.function.name,
+        description: t.function.description ?? "",
+        input_schema: t.function.parameters ?? { type: "object", properties: {} }
+      }))
+  }
+
+  function anthropicToOpenaiResponse(anthropicBody: any, model: string): any {
+    const textBlocks = (anthropicBody.content ?? []).filter((b: any) => b.type === "text")
+    const toolBlocks = (anthropicBody.content ?? []).filter((b: any) => b.type === "tool_use")
+
+    const text = textBlocks.map((b: any) => b.text).join("") || (toolBlocks.length > 0 ? null : "")
+
+    const message: any = { role: "assistant", content: text }
+
+    if (toolBlocks.length > 0) {
+      message.tool_calls = toolBlocks.map((b: any, i: number) => ({
+        id: b.id,
+        type: "function",
+        function: {
+          name: b.name,
+          arguments: JSON.stringify(b.input ?? {})
+        }
+      }))
+    }
+
+    const finishReason = anthropicBody.stop_reason === "tool_use" ? "tool_calls"
+      : anthropicBody.stop_reason === "max_tokens" ? "length"
+      : "stop"
 
     return {
       id: `chatcmpl-${Date.now()}`,
@@ -649,8 +735,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       model,
       choices: [{
         index: 0,
-        message: { role: "assistant", content: text },
-        finish_reason: anthropicBody.stop_reason === "end_turn" ? "stop" : "stop"
+        message,
+        finish_reason: finishReason
       }],
       usage: {
         prompt_tokens: anthropicBody.usage?.input_tokens ?? 0,
@@ -686,6 +772,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (system) anthropicBody.system = system
       if (body.max_tokens) anthropicBody.max_tokens = body.max_tokens
       if (body.temperature !== undefined) anthropicBody.temperature = body.temperature
+      // Convert OpenAI tools format to Anthropic tools format
+      if (body.tools?.length) {
+        anthropicBody.tools = openaiToAnthropicTools(body.tools)
+      }
 
       // Forward to our own /v1/messages handler by making an internal request
       const internalRes = await app.fetch(new Request(`http://localhost/v1/messages`, {
@@ -699,7 +789,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         if (anthropicJson.type === "error") {
           return c.json({ error: anthropicJson.error }, internalRes.status as any)
         }
-        return c.json(anthropicToOpenaiResponse(anthropicJson, requestedModel, false))
+        return c.json(anthropicToOpenaiResponse(anthropicJson, requestedModel))
       }
 
       // Streaming: translate SSE events from Anthropic format to OpenAI format

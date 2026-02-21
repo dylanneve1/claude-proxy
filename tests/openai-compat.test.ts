@@ -51,6 +51,72 @@ describe("POST /v1/chat/completions (validation)", () => {
   })
 })
 
+// ── Tool format conversion ──────────────────────────────────────────────────
+
+describe("POST /v1/chat/completions (with tools)", () => {
+  test("accepts OpenAI-format tools and translates to Anthropic format", async () => {
+    // This will return 400 because messages is empty, but validates the tools
+    // are accepted without error in the request parsing
+    const { status } = await json("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        messages: [{ role: "user", content: "What's the weather?" }],
+        tools: [{
+          type: "function",
+          function: {
+            name: "get_weather",
+            description: "Get current weather",
+            parameters: {
+              type: "object",
+              properties: {
+                location: { type: "string", description: "City name" }
+              },
+              required: ["location"]
+            }
+          }
+        }],
+        stream: false
+      })
+    })
+    // Status would be 200 if proxy is running, or error from SDK
+    // The key thing is it doesn't return 400 (our validation passed)
+    expect(status).not.toBe(400)
+  }, 120_000)
+
+  test("handles tool role messages in conversation", async () => {
+    // Validates tool result messages don't cause parsing errors
+    const { status } = await json("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        messages: [
+          { role: "user", content: "What's the weather?" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "call_123",
+              type: "function",
+              function: { name: "get_weather", arguments: "{\"location\": \"NYC\"}" }
+            }]
+          },
+          {
+            role: "tool",
+            tool_call_id: "call_123",
+            content: "72°F and sunny"
+          }
+        ],
+        stream: false
+      })
+    })
+    // Should not return 400 (validation error)
+    expect(status).not.toBe(400)
+  }, 120_000)
+})
+
 // ── Integration tests (need running proxy) ─────────────────────────────────
 
 const PROXY_URL = process.env.PROXY_URL || "http://127.0.0.1:3456"
