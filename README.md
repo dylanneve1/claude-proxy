@@ -8,32 +8,61 @@ openclaw → claude-proxy (:3456) → Claude Agent SDK → Claude Max subscripti
 
 ## Features
 
+- **Drop-in Anthropic API replacement** — set `ANTHROPIC_BASE_URL=http://127.0.0.1:3456` in any SDK and it just works
 - **Claude Max** — zero API cost, uses your existing subscription via the official Agent SDK
-- **Streaming SSE** — `message_start` emitted immediately so long agent runs never hit HTTP timeouts
-- **Multi-message sends** — Claude calls the `message` MCP tool multiple times to send separate Telegram messages, then outputs `NO_REPLY` to suppress duplicate delivery
+- **Full tool use support** — returns proper `tool_use` content blocks with `stop_reason: "tool_use"`, handles multi-turn tool loops, `input_json_delta` streaming
+- **`/v1/models` endpoint** — returns all supported model IDs
+- **Streaming SSE** — `message_start` emitted immediately so long agent runs never hit HTTP timeouts; 15 s heartbeat keeps connections alive
+- **Multi-message sends** — Claude calls the `message` MCP tool multiple times to send separate Telegram messages in openclaw context
 - **Image / file sends** — Claude writes to `/tmp/`, calls `message` with `filePath`, proxy converts to `file://` URL for gateway delivery
 - **Inbound images** — base64 image blocks saved to temp files so Claude can read them with the `read` tool
-- **Tool serialization** — `tool_use` / `tool_result` / `thinking` blocks serialized cleanly for the Agent SDK
 - **Large tool result protection** — results truncated at 4 000 chars to prevent context explosion
 - **Per-request MCP servers** — no shared state between concurrent requests
-- **Empty response fallback** — if maxTurns is exhausted with no text output, returns `"..."` instead of silence
+- **Non-zero usage stats** — rough token estimates returned in every response
 
 ## Architecture
 
+The proxy has two operating modes selected automatically per request:
+
+### Agent mode (openclaw / no caller tools)
 ```
-POST /v1/messages  (Anthropic Messages API)
+POST /v1/messages
   │
   ├─ Deserialize messages → text, images (→ /tmp/), tool_use, tool_result
-  ├─ Build prompt: system + SEND_MESSAGE_NOTE + conversation history
+  ├─ Build prompt: system + MCP tool note + conversation history
   │
   └─ Claude Agent SDK  query()  (maxTurns=50)
        │
-       ├─ MCP tools:
-       │    • message  → openclaw gateway WS (Ed25519 auth, operator.admin scope)
-       │    • read / write / edit / bash / glob / grep
-       │
-       └─ Normalize response → Anthropic SSE stream or JSON
+       ├─ MCP tools: message, read, write, edit, bash, glob, grep
+       └─ Normalize → stream text or JSON
 ```
+
+### Client tool mode (any app using Anthropic tool use API)
+```
+POST /v1/messages  with  "tools": [...]
+  │
+  ├─ Inject tool definitions into system prompt
+  │
+  └─ Claude Agent SDK  query()  (maxTurns=1)
+       │
+       └─ Parse <tool_use> blocks from output
+            └─ Emit tool_use content blocks + stop_reason="tool_use"
+```
+
+Client tool mode is detected automatically: the request has `tools` and doesn't look like an openclaw session (no `conversation_label` / `chat id:` in the system prompt).
+
+## Drop-in Usage
+
+```bash
+# Any Anthropic SDK — set the base URL, keep any API key value
+ANTHROPIC_BASE_URL=http://127.0.0.1:3456 ANTHROPIC_API_KEY=dummy your-app
+
+# Or in Python
+import anthropic
+client = anthropic.Anthropic(base_url="http://127.0.0.1:3456", api_key="dummy")
+```
+
+Full tool use, streaming, and `/v1/models` work out of the box.
 
 ## Quick Start
 
