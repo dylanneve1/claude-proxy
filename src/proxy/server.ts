@@ -30,32 +30,17 @@ const ALLOWED_MCP_TOOLS = [
   `mcp__${MCP_SERVER_NAME}__bash`,
   `mcp__${MCP_SERVER_NAME}__glob`,
   `mcp__${MCP_SERVER_NAME}__grep`,
-  `mcp__${MCP_SERVER_NAME}__send_message`,
+  `mcp__${MCP_SERVER_NAME}__message`,
 ]
 
-// Injected after the system prompt. Teaches Claude how to send multiple
-// separate Telegram messages and how to send files/images.
+// Injected after the system prompt. Bridges openclaw's "message" tool
+// description to the actual MCP tool name, and clarifies file paths.
 const SEND_MESSAGE_NOTE = `
-## Telegram message delivery rules
-
-**Normal single reply:** Just return your text. It will be delivered automatically as one Telegram message.
-
-**Multiple separate messages:** Use \`mcp__opencode__send_message\` once per message, then output ONLY: \`NO_REPLY\`
-- Extract the chat ID from \`conversation_label\` in the user message (e.g. "chat id:-1001426819337" → use "-1001426819337")
-- Call send_message once per message with the chat ID and text
-- After ALL calls finish, output ONLY: NO_REPLY (no other text)
-
-**Sending a file or image (photo/document):**
-1. Create the file in /tmp/ using bash or write tool (e.g. /tmp/image.png)
-2. Call \`mcp__opencode__send_message\` with \`to\` = chat ID and \`mediaUrl\` = "file:///tmp/image.png"
-3. Output ONLY: NO_REPLY
-- NEVER put file paths like "file:/tmp/..." in your text response — they will NOT deliver the file, just show the path string
-- Always use send_message with mediaUrl to deliver files
-
-**Key rules:**
-- Use NO_REPLY (exact string, uppercase) after all send_message calls
-- Never mix send_message calls with a text reply in the same turn
-- For a single plain text reply, just return the text — do not use send_message`
+## Tool note (proxy context)
+The \`message\` tool described in your system prompt is available as \`mcp__opencode__message\`.
+- Use it exactly as described: action=send, with \`to\` (chat ID from conversation_label), \`message\` (text), and/or \`filePath\` (absolute path like /tmp/file.png).
+- Always write files to /tmp/ before sending — use bash or write tool with an absolute /tmp/ path.
+- After all message tool calls, output ONLY: NO_REPLY`
 
 function resolveClaudeExecutable(): string {
   try {

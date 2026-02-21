@@ -206,7 +206,7 @@ export function createMcpServer() {
               : path.resolve(getCwd(), args.path)
             await fs.mkdir(path.dirname(filePath), { recursive: true })
             await fs.writeFile(filePath, args.content, "utf-8")
-            return { content: [{ type: "text", text: `Successfully wrote to ${args.path}` }] }
+            return { content: [{ type: "text", text: `Successfully wrote to ${filePath}` }] }
           } catch (error) {
             return {
               content: [{ type: "text", text: `Error writing file: ${error instanceof Error ? error.message : String(error)}` }],
@@ -317,30 +317,39 @@ export function createMcpServer() {
       ),
 
       tool(
-        "send_message",
-        [
-          "Send a Telegram message (text and/or file) via the openclaw gateway.",
-          "Use this to send multiple SEPARATE messages in one turn, or to send a file/image.",
-          "For files/images: first create the file (e.g. with bash or write), then call this with mediaUrl='file:///tmp/yourfile.png'.",
-          "Call once per message/file. After ALL calls complete, output ONLY: NO_REPLY",
-          "For a normal single text reply, just return text directly — do NOT use this tool.",
-          "IMPORTANT: Never put file paths in your text response — always use mediaUrl to deliver files."
-        ].join(" "),
+        "message",
+        "Send a Telegram message or file via the openclaw gateway. Use action=send (default). Provide `to` (chat ID from conversation_label, e.g. '-1001426819337'), and either `message` (text) or `filePath`/`path`/`media` (absolute path to file in /tmp/, e.g. '/tmp/image.png'). Always write files to /tmp/ first. After all calls, output only: NO_REPLY",
         {
+          action: z.string().optional().describe("Action to perform. Use 'send' (default)."),
           to: z.string().describe(
-            "Telegram chat ID. Extract from conversation_label in the user message, e.g. if label ends with 'chat id:-1001234567890' use '-1001234567890'."
+            "Telegram chat ID. Extract from conversation_label: e.g. 'chat id:-1001426819337' → '-1001426819337'."
           ),
-          message: z.string().optional().describe("The text message to send (optional if mediaUrl is provided)"),
-          mediaUrl: z.string().optional().describe(
-            "URL or local file path (as file:///tmp/file.png) of an image or file to send as a Telegram attachment. Use this to send photos, documents, etc."
-          )
+          message: z.string().optional().describe("Text message to send."),
+          filePath: z.string().optional().describe("Absolute path to a file in /tmp/ to send as attachment, e.g. '/tmp/image.png'."),
+          path: z.string().optional().describe("Alias for filePath."),
+          media: z.string().optional().describe("Alias for filePath — file path or URL to send as media attachment."),
+          caption: z.string().optional().describe("Caption text to accompany a media attachment."),
         },
         async (args) => {
           try {
-            if (!args.message && !args.mediaUrl) {
-              return { content: [{ type: "text", text: "Error: must provide message or mediaUrl" }], isError: true }
+            // Resolve media path from whichever alias Claude provides
+            const rawMedia = args.media ?? args.path ?? args.filePath
+            // Normalize to a file:// URL if it's a plain path (gateway requires this for local files)
+            let mediaUrl: string | undefined
+            if (rawMedia) {
+              if (rawMedia.startsWith("http://") || rawMedia.startsWith("https://") || rawMedia.startsWith("file://")) {
+                mediaUrl = rawMedia
+              } else {
+                // Plain absolute path → file:// URL
+                const absPath = rawMedia.startsWith("/") ? rawMedia : `/tmp/${rawMedia}`
+                mediaUrl = `file://${absPath}`
+              }
             }
-            const result = await sendViaGateway(args.to, args.message, args.mediaUrl)
+            const textMessage = args.message ?? args.caption
+            if (!textMessage && !mediaUrl) {
+              return { content: [{ type: "text", text: "Error: provide message or filePath/path/media" }], isError: true }
+            }
+            const result = await sendViaGateway(args.to, textMessage, mediaUrl)
             if (result.ok) {
               return { content: [{ type: "text", text: `Sent to ${args.to}` }] }
             }
