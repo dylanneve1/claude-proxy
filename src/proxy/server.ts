@@ -185,6 +185,7 @@ function buildQueryOptions(
     clientToolMode?: boolean
     clientSystemPrompt?: string
     mcpState?: McpServerState
+    abortController?: AbortController
   } = {}
 ) {
   const base = {
@@ -192,7 +193,9 @@ function buildQueryOptions(
     pathToClaudeCodeExecutable: claudeExecutable,
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
+    persistSession: false,
     ...(opts.partial ? { includePartialMessages: true } : {}),
+    ...(opts.abortController ? { abortController: opts.abortController } : {}),
     disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
   }
 
@@ -222,6 +225,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   app.use("*", cors())
 
+  // Request logging
+  app.use("*", async (c, next) => {
+    const start = Date.now()
+    await next()
+    const ms = Date.now() - start
+    claudeLog("proxy.http", { method: c.req.method, path: c.req.path, status: c.res.status, ms })
+  })
+
   app.get("/", (c) => c.json({
     status: "ok",
     service: "claude-max-proxy",
@@ -232,7 +243,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   const MODELS = [
     { type: "model", id: "claude-opus-4-6",              display_name: "Claude Opus 4.6",    created_at: "2025-08-01T00:00:00Z" },
+    { type: "model", id: "claude-opus-4-6-20250801",     display_name: "Claude Opus 4.6",    created_at: "2025-08-01T00:00:00Z" },
     { type: "model", id: "claude-sonnet-4-6",            display_name: "Claude Sonnet 4.6",  created_at: "2025-08-01T00:00:00Z" },
+    { type: "model", id: "claude-sonnet-4-6-20250801",   display_name: "Claude Sonnet 4.6",  created_at: "2025-08-01T00:00:00Z" },
+    { type: "model", id: "claude-sonnet-4-5-20250929",   display_name: "Claude Sonnet 4.5",  created_at: "2025-09-29T00:00:00Z" },
     { type: "model", id: "claude-haiku-4-5",             display_name: "Claude Haiku 4.5",   created_at: "2025-10-01T00:00:00Z" },
     { type: "model", id: "claude-haiku-4-5-20251001",    display_name: "Claude Haiku 4.5",   created_at: "2025-10-01T00:00:00Z" },
   ]
@@ -280,6 +294,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const stream = body.stream ?? true
       const clientToolMode = isClientToolMode(body)
       const mcpState: McpServerState = { messageSent: false }
+      const abortController = new AbortController()
+      const timeout = setTimeout(() => abortController.abort(), finalConfig.requestTimeoutMs)
 
       claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode })
 
@@ -324,7 +340,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (!stream) {
         let fullText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, clientSystemPrompt, mcpState }) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, clientSystemPrompt, mcpState, abortController }) })) {
             if (message.type === "assistant") {
               fullText = ""
               for (const block of message.message.content) {
@@ -333,6 +349,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
           }
         } finally {
+          clearTimeout(timeout)
           cleanupTempFiles(tempFiles)
         }
 
@@ -396,7 +413,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (clientToolMode) {
               let fullText = ""
               try {
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, clientSystemPrompt }) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, clientSystemPrompt, abortController }) })) {
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -406,6 +423,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
               } finally {
                 clearInterval(heartbeat)
+                clearTimeout(timeout)
                 cleanupTempFiles(tempFiles)
               }
 
@@ -444,7 +462,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             let fullText = ""
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, mcpState }) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, mcpState, abortController }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -458,6 +476,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
             } finally {
               clearInterval(heartbeat)
+              clearTimeout(timeout)
               cleanupTempFiles(tempFiles)
             }
 
@@ -477,10 +496,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             controller.close()
 
           } catch (error) {
-            claudeLog("proxy.stream.error", { reqId, error: error instanceof Error ? error.message : String(error) })
+            clearTimeout(timeout)
+            const isAbort = error instanceof Error && error.name === "AbortError"
+            const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
+            const errType = isAbort ? "timeout_error" : "api_error"
+            claudeLog("proxy.stream.error", { reqId, error: errMsg })
             cleanupTempFiles(tempFiles)
             try {
-              sse("error", { type: "error", error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" } })
+              sse("error", { type: "error", error: { type: errType, message: errMsg } })
               controller.close()
             } catch {}
           }
@@ -496,11 +519,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       })
 
     } catch (error) {
-      claudeLog("proxy.error", { reqId, error: error instanceof Error ? error.message : String(error) })
-      return c.json({
-        type: "error",
-        error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" }
-      }, 500)
+      const isAbort = error instanceof Error && error.name === "AbortError"
+      const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
+      const errType = isAbort ? "timeout_error" : "api_error"
+      const status = isAbort ? 408 : 500
+      claudeLog("proxy.error", { reqId, error: errMsg })
+      return c.json({ type: "error", error: { type: errType, message: errMsg } }, status)
     }
   }
 
