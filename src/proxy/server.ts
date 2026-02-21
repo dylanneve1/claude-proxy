@@ -194,6 +194,7 @@ function buildQueryOptions(
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
     persistSession: false,
+    settingSources: [],
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
     disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
@@ -225,12 +226,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   app.use("*", cors())
 
-  // Request logging
+  // Anthropic-compatible headers + request logging
   app.use("*", async (c, next) => {
     const start = Date.now()
+    const requestId = c.req.header("x-request-id") ?? `req_${randomBytes(12).toString("hex")}`
+    c.header("x-request-id", requestId)
+    c.header("request-id", requestId)
     await next()
     const ms = Date.now() - start
-    claudeLog("proxy.http", { method: c.req.method, path: c.req.path, status: c.res.status, ms })
+    claudeLog("proxy.http", { method: c.req.method, path: c.req.path, status: c.res.status, ms, requestId })
   })
 
   app.get("/", (c) => c.json({

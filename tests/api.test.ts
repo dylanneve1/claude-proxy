@@ -57,6 +57,14 @@ describe("GET /v1/models", () => {
     expect(ids).toContain("claude-sonnet-4-6")
     expect(ids.some((id: string) => id.includes("haiku"))).toBe(true)
   })
+
+  test("includes dated model variants", async () => {
+    const { body } = await json("/v1/models")
+    const ids = body.data.map((m: any) => m.id)
+    expect(ids).toContain("claude-opus-4-6-20250801")
+    expect(ids).toContain("claude-sonnet-4-6-20250801")
+    expect(ids).toContain("claude-haiku-4-5-20251001")
+  })
 })
 
 describe("GET /models (alias)", () => {
@@ -174,7 +182,7 @@ describe("POST /v1/messages (validation)", () => {
   })
 })
 
-// ── CORS ─────────────────────────────────────────────────────────────────────
+// ── Headers ──────────────────────────────────────────────────────────────────
 
 describe("CORS", () => {
   test("includes CORS headers", async () => {
@@ -182,8 +190,24 @@ describe("CORS", () => {
       method: "OPTIONS",
       headers: { Origin: "http://example.com" }
     })
-    // Hono CORS middleware sets these
     expect(res.headers.get("access-control-allow-origin")).toBeDefined()
+  })
+})
+
+describe("Request ID", () => {
+  test("generates request-id when not provided", async () => {
+    const res = await req("/")
+    const requestId = res.headers.get("x-request-id")
+    expect(requestId).toBeDefined()
+    expect(requestId!.startsWith("req_")).toBe(true)
+  })
+
+  test("echoes back provided x-request-id", async () => {
+    const res = await req("/", {
+      headers: { "x-request-id": "test-id-123" }
+    })
+    expect(res.headers.get("x-request-id")).toBe("test-id-123")
+    expect(res.headers.get("request-id")).toBe("test-id-123")
   })
 })
 
