@@ -11,7 +11,7 @@ import { tmpdir } from "os"
 import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
-import { createMcpServer } from "../mcpTools"
+import { createMcpServer, type McpServerState } from "../mcpTools"
 
 const PROXY_VERSION: string = (() => {
   try {
@@ -40,11 +40,10 @@ const ALLOWED_MCP_TOOLS = [
   `mcp__${MCP_SERVER_NAME}__message`,
 ]
 
-// Injected after the system prompt in agent mode. Bridges openclaw's "message"
-// tool to the actual MCP name and enforces the correct agentic workflow.
-const SEND_MESSAGE_NOTE = `
-## Tool note (proxy context)
-The \`message\` tool is available as \`mcp__opencode__message\`. Your text output does NOT reach the user — only \`mcp__opencode__message\` calls deliver messages. Always complete the full task with tools, send the result via \`mcp__opencode__message\`, then output ONLY: NO_REPLY`
+// Injected after the system prompt in agent mode. Only bridges the tool name —
+// the proxy auto-suppresses the text response when the message tool is used,
+// so Claude never needs to know about NO_REPLY.
+const SEND_MESSAGE_NOTE = `\nThe \`message\` tool is available as \`mcp__opencode__message\`.`
 
 function resolveClaudeExecutable(): string {
   try {
@@ -218,7 +217,7 @@ function roughTokens(text: string): number {
 
 // ── Query options builder ────────────────────────────────────────────────────
 
-function buildQueryOptions(model: "sonnet" | "opus" | "haiku", partial?: boolean, clientToolMode?: boolean) {
+function buildQueryOptions(model: "sonnet" | "opus" | "haiku", partial?: boolean, clientToolMode?: boolean, mcpState?: McpServerState) {
   if (clientToolMode) {
     // Single-turn, no MCP — caller manages the tool loop
     return {
@@ -239,7 +238,7 @@ function buildQueryOptions(model: "sonnet" | "opus" | "haiku", partial?: boolean
     mcpServers: {
       // Fresh instance per request — avoids concurrency issues when multiple
       // requests share the same SDK MCP server object.
-      [MCP_SERVER_NAME]: createMcpServer()
+      [MCP_SERVER_NAME]: createMcpServer(mcpState)
     }
   }
 }
@@ -312,6 +311,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const model = mapModelToClaudeModel(body.model || "sonnet")
       const stream = body.stream ?? true
       const clientToolMode = isClientToolMode(body)
+      const mcpState: McpServerState = { messageSent: false }
 
       claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode })
 
@@ -348,14 +348,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
-        // Reset on each assistant turn so we only return the FINAL turn's text.
-        // This prevents intermediate tool-use narration ("I'll read the file…")
-        // from leaking into the response when the agent does multi-turn work.
+        // Reset on each assistant turn — only the FINAL turn's text is returned.
         let fullText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, false, clientToolMode) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, false, clientToolMode, mcpState) })) {
             if (message.type === "assistant") {
-              fullText = ""   // discard previous turn — keep only the last
+              fullText = ""
               for (const block of message.message.content) {
                 if (block.type === "text") fullText += block.text
               }
@@ -381,8 +379,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           })
         }
 
+        // Agent mode: if the message tool delivered anything, suppress the text response.
+        if (mcpState.messageSent) fullText = "NO_REPLY"
         const normalized = normalizeResponse(fullText)
-        claudeLog("proxy.response", { reqId, len: normalized.length })
+        claudeLog("proxy.response", { reqId, len: normalized.length, messageSent: mcpState.messageSent })
         return c.json({
           id: `msg_${Date.now()}`,
           type: "message", role: "assistant",
@@ -479,7 +479,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
             let fullText = ""
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, true) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, true, false, mcpState) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -496,12 +496,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               cleanupTempFiles(tempFiles)
             }
 
-            // If agent produced nothing (maxTurns exhausted, etc.) emit "..." fallback.
-            // NO_REPLY: already streamed live — openclaw detects "ends with NO_REPLY" on its end.
-            const normalized = normalizeResponse(fullText)
-            claudeLog("proxy.stream.done", { reqId, len: fullText.length, normalized: normalized !== fullText })
+            claudeLog("proxy.stream.done", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
 
-            if (!fullText || !fullText.trim()) {
+            if (mcpState.messageSent) {
+              // Messages were delivered via tool — append NO_REPLY so openclaw suppresses
+              // the streamed text response (avoids double-delivering to Telegram).
+              if (!fullText.trimEnd().endsWith("NO_REPLY")) {
+                sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nNO_REPLY" } })
+              }
+            } else if (!fullText || !fullText.trim()) {
+              // Empty response fallback
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 

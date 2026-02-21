@@ -162,8 +162,14 @@ async function sendViaGateway(
 // ── MCP server factory ───────────────────────────────────────────────────────
 // Returns a fresh MCP server instance. Called per-request to avoid concurrency
 // issues when multiple simultaneous queries share the same server object.
+//
+// state.messageSent is set to true when a message is successfully delivered.
+// The proxy uses this to automatically suppress its own text response so
+// openclaw doesn't double-deliver — no NO_REPLY sentinel needed from Claude.
 
-export function createMcpServer() {
+export interface McpServerState { messageSent: boolean }
+
+export function createMcpServer(state: McpServerState = { messageSent: false }) {
   return createSdkMcpServer({
     name: "opencode",
     version: "1.0.0",
@@ -318,7 +324,7 @@ export function createMcpServer() {
 
       tool(
         "message",
-        "Send a Telegram message or file via the openclaw gateway. Use action=send (default). Provide `to` (chat ID from conversation_label, e.g. '-1001426819337'), and either `message` (text) or `filePath`/`path`/`media` (absolute path to file in /tmp/, e.g. '/tmp/image.png'). Always write files to /tmp/ first. After all calls, output only: NO_REPLY",
+        "Send a Telegram message or file via the openclaw gateway. Use action=send (default). Provide `to` (chat ID from conversation_label, e.g. '-1001426819337'), and either `message` (text) or `filePath`/`path`/`media` (absolute path to file in /tmp/, e.g. '/tmp/image.png'). Always write files to /tmp/ first.",
         {
           action: z.string().optional().describe("Action to perform. Use 'send' (default)."),
           to: z.string().describe(
@@ -351,6 +357,7 @@ export function createMcpServer() {
             }
             const result = await sendViaGateway(args.to, textMessage, mediaUrl)
             if (result.ok) {
+              state.messageSent = true
               return { content: [{ type: "text", text: `Sent to ${args.to}` }] }
             }
             return {
