@@ -242,7 +242,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     service: "claude-max-proxy",
     version: PROXY_VERSION,
     format: "anthropic",
-    endpoints: ["/v1/messages", "/messages", "/v1/models", "/models"]
+    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions"]
   }))
 
   const MODELS = [
@@ -543,6 +543,171 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.post("/v1/messages/batches", handleBatches)
   app.get("/v1/messages/batches", handleBatches)
   app.get("/v1/messages/batches/:id", handleBatches)
+
+  // ── OpenAI-compatible /v1/chat/completions ─────────────────────────────
+  // Translates OpenAI ChatCompletion format to/from Anthropic Messages API
+  // so tools expecting OpenAI endpoints (LangChain, LiteLLM, etc.) just work.
+
+  function openaiToAnthropicMessages(messages: any[]): { system?: string; messages: any[] } {
+    let system: string | undefined
+    const converted: any[] = []
+
+    for (const msg of messages) {
+      if (msg.role === "system") {
+        system = (system ? system + "\n" : "") + (msg.content ?? "")
+      } else if (msg.role === "user" || msg.role === "assistant") {
+        converted.push({ role: msg.role, content: msg.content ?? "" })
+      }
+    }
+    return { system, messages: converted }
+  }
+
+  function anthropicToOpenaiResponse(anthropicBody: any, model: string, stream: boolean): any {
+    const text = anthropicBody.content
+      ?.filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("") || ""
+
+    return {
+      id: `chatcmpl-${Date.now()}`,
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{
+        index: 0,
+        message: { role: "assistant", content: text },
+        finish_reason: anthropicBody.stop_reason === "end_turn" ? "stop" : "stop"
+      }],
+      usage: {
+        prompt_tokens: anthropicBody.usage?.input_tokens ?? 0,
+        completion_tokens: anthropicBody.usage?.output_tokens ?? 0,
+        total_tokens: (anthropicBody.usage?.input_tokens ?? 0) + (anthropicBody.usage?.output_tokens ?? 0)
+      }
+    }
+  }
+
+  const handleChatCompletions = async (c: Context) => {
+    try {
+      const body = await c.req.json()
+      const { system, messages } = openaiToAnthropicMessages(body.messages ?? [])
+      const stream = body.stream ?? false
+      const requestedModel = body.model ?? "claude-sonnet-4-6"
+
+      // Build Anthropic-format request body
+      const anthropicBody: any = {
+        model: requestedModel,
+        messages,
+        stream,
+      }
+      if (system) anthropicBody.system = system
+      if (body.max_tokens) anthropicBody.max_tokens = body.max_tokens
+      if (body.temperature !== undefined) anthropicBody.temperature = body.temperature
+
+      // Forward to our own /v1/messages handler by making an internal request
+      const internalRes = await app.fetch(new Request(`http://localhost/v1/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(anthropicBody)
+      }))
+
+      if (!stream) {
+        const anthropicJson = await internalRes.json() as any
+        if (anthropicJson.type === "error") {
+          return c.json({ error: anthropicJson.error }, internalRes.status as any)
+        }
+        return c.json(anthropicToOpenaiResponse(anthropicJson, requestedModel, false))
+      }
+
+      // Streaming: translate SSE events from Anthropic format to OpenAI format
+      const encoder = new TextEncoder()
+      const readable = new ReadableStream({
+        async start(controller) {
+          try {
+            const reader = internalRes.body?.getReader()
+            if (!reader) { controller.close(); return }
+
+            const decoder = new TextDecoder()
+            let buffer = ""
+
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              buffer += decoder.decode(value, { stream: true })
+
+              const lines = buffer.split("\n")
+              buffer = lines.pop() ?? ""
+
+              for (const line of lines) {
+                if (!line.startsWith("data: ")) continue
+                try {
+                  const event = JSON.parse(line.slice(6))
+
+                  if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+                    const chunk = {
+                      id: `chatcmpl-${Date.now()}`,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model: requestedModel,
+                      choices: [{
+                        index: 0,
+                        delta: { content: event.delta.text },
+                        finish_reason: null
+                      }]
+                    }
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+                  } else if (event.type === "message_stop") {
+                    const chunk = {
+                      id: `chatcmpl-${Date.now()}`,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model: requestedModel,
+                      choices: [{
+                        index: 0,
+                        delta: {},
+                        finish_reason: "stop"
+                      }]
+                    }
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"))
+                  }
+                } catch {}
+              }
+            }
+            controller.close()
+          } catch {
+            controller.close()
+          }
+        }
+      })
+
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        }
+      })
+    } catch (error) {
+      return c.json({
+        error: { message: error instanceof Error ? error.message : "Unknown error", type: "server_error" }
+      }, 500)
+    }
+  }
+
+  app.post("/v1/chat/completions", handleChatCompletions)
+  app.post("/chat/completions", handleChatCompletions)
+
+  // OpenAI-format model listing
+  const handleOpenaiModels = (c: Context) => c.json({
+    object: "list",
+    data: MODELS.map(m => ({
+      id: m.id,
+      object: "model",
+      created: Math.floor(new Date(m.created_at).getTime() / 1000),
+      owned_by: "anthropic"
+    }))
+  })
+  app.get("/v1/chat/models", handleOpenaiModels)
 
   return { app, config: finalConfig }
 }
