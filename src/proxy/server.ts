@@ -6,12 +6,19 @@ import type { ProxyConfig } from "./types"
 import { DEFAULT_PROXY_CONFIG } from "./types"
 import { claudeLog } from "../logger"
 import { execSync } from "child_process"
-import { existsSync, writeFileSync, unlinkSync } from "fs"
+import { existsSync, writeFileSync, unlinkSync, readFileSync } from "fs"
 import { tmpdir } from "os"
 import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 import { createMcpServer } from "../mcpTools"
+
+const PROXY_VERSION: string = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../../package.json"), "utf-8"))
+    return pkg.version ?? "unknown"
+  } catch { return "unknown" }
+})()
 
 // Built-in Claude Code tools to block. "Read" is intentionally kept so Claude
 // can open image temp-files saved from inbound media blocks.
@@ -252,7 +259,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.get("/", (c) => c.json({
     status: "ok",
     service: "claude-max-proxy",
-    version: "2.0.1",
+    version: PROXY_VERSION,
     format: "anthropic",
     endpoints: ["/v1/messages", "/messages", "/v1/models", "/models"]
   }))
@@ -267,6 +274,34 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   const handleModels = (c: Context) => c.json({ data: MODELS })
   app.get("/v1/models", handleModels)
   app.get("/models", handleModels)
+
+  const handleModel = (c: Context) => {
+    const id = c.req.param("id")
+    const model = MODELS.find(m => m.id === id)
+    if (!model) return c.json({ type: "error", error: { type: "not_found_error", message: `Model \`${id}\` not found` } }, 404)
+    return c.json(model)
+  }
+  app.get("/v1/models/:id", handleModel)
+  app.get("/models/:id", handleModel)
+
+  // Rough token count — enough to satisfy clients that call this before streaming
+  const handleCountTokens = async (c: Context) => {
+    try {
+      const body = await c.req.json()
+      const sysText = Array.isArray(body.system)
+        ? body.system.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n")
+        : String(body.system ?? "")
+      const msgText = (body.messages ?? [])
+        .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content))
+        .join("\n")
+      const inputTokens = roughTokens(sysText + msgText)
+      return c.json({ input_tokens: inputTokens })
+    } catch {
+      return c.json({ input_tokens: 0 })
+    }
+  }
+  app.post("/v1/messages/count_tokens", handleCountTokens)
+  app.post("/messages/count_tokens", handleCountTokens)
 
   const handleMessages = async (c: Context) => {
     const reqId = randomBytes(4).toString("hex")
@@ -465,13 +500,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               cleanupTempFiles(tempFiles)
             }
 
-            // Normalize: collapse to "NO_REPLY" if text ends with it; emit "..."
-            // if agent produced nothing (maxTurns exhausted, etc.)
+            // If agent produced nothing (maxTurns exhausted, etc.) emit "..." fallback.
+            // NO_REPLY: already streamed live — openclaw detects "ends with NO_REPLY" on its end.
             const normalized = normalizeResponse(fullText)
             claudeLog("proxy.stream.done", { reqId, len: fullText.length, normalized: normalized !== fullText })
 
-            if (normalized !== fullText && (!fullText || !fullText.trim())) {
-              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: normalized } })
+            if (!fullText || !fullText.trim()) {
+              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 
             sse("content_block_stop", { type: "content_block_stop", index: 0 })
