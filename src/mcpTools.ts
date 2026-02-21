@@ -51,11 +51,15 @@ function invalidateGatewayConfig() {
 }
 
 /**
- * Send a single message to a Telegram chat via the openclaw gateway WebSocket.
+ * Send a message (text and/or media) to a Telegram chat via the openclaw gateway WebSocket.
  * Uses Ed25519 device identity with operator.admin scope (bypasses all method
  * scope checks server-side). Opens a fresh WS connection per call.
  */
-async function sendViaGateway(to: string, message: string): Promise<{ ok: boolean; error?: string }> {
+async function sendViaGateway(
+  to: string,
+  message?: string,
+  mediaUrl?: string
+): Promise<{ ok: boolean; error?: string }> {
   let identity: ReturnType<typeof loadGatewayConfig>["identity"]
   let token: string
   try {
@@ -129,14 +133,16 @@ async function sendViaGateway(to: string, message: string): Promise<{ ok: boolea
             return
           }
           connected = true
+          const sendParams: Record<string, unknown> = {
+            to,
+            channel: "telegram",
+            idempotencyKey: randomBytes(16).toString("hex")
+          }
+          if (message) sendParams.message = message
+          if (mediaUrl) sendParams.mediaUrl = mediaUrl
           ws.send(JSON.stringify({
             type: "req", id: "send1", method: "send",
-            params: {
-              to,
-              channel: "telegram",
-              message,
-              idempotencyKey: randomBytes(16).toString("hex")
-            }
+            params: sendParams
           }))
 
         } else if (connected && frame.type === "res" && frame.id === "send1") {
@@ -313,20 +319,28 @@ export function createMcpServer() {
       tool(
         "send_message",
         [
-          "Send a Telegram message via the openclaw gateway.",
-          "Call this once per message. Supports multiple calls in a single turn to deliver separate messages.",
-          "After all send_message calls complete, respond with only: NO_REPLY",
-          "Never use this for a normal single reply — just return the text directly instead."
+          "Send a Telegram message (text and/or file) via the openclaw gateway.",
+          "Use this to send multiple SEPARATE messages in one turn, or to send a file/image.",
+          "For files/images: first create the file (e.g. with bash or write), then call this with mediaUrl='file:///tmp/yourfile.png'.",
+          "Call once per message/file. After ALL calls complete, output ONLY: NO_REPLY",
+          "For a normal single text reply, just return text directly — do NOT use this tool.",
+          "IMPORTANT: Never put file paths in your text response — always use mediaUrl to deliver files."
         ].join(" "),
         {
           to: z.string().describe(
             "Telegram chat ID. Extract from conversation_label in the user message, e.g. if label ends with 'chat id:-1001234567890' use '-1001234567890'."
           ),
-          message: z.string().describe("The message text to send")
+          message: z.string().optional().describe("The text message to send (optional if mediaUrl is provided)"),
+          mediaUrl: z.string().optional().describe(
+            "URL or local file path (as file:///tmp/file.png) of an image or file to send as a Telegram attachment. Use this to send photos, documents, etc."
+          )
         },
         async (args) => {
           try {
-            const result = await sendViaGateway(args.to, args.message)
+            if (!args.message && !args.mediaUrl) {
+              return { content: [{ type: "text", text: "Error: must provide message or mediaUrl" }], isError: true }
+            }
+            const result = await sendViaGateway(args.to, args.message, args.mediaUrl)
             if (result.ok) {
               return { content: [{ type: "text", text: `Sent to ${args.to}` }] }
             }
