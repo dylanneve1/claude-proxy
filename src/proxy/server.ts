@@ -107,10 +107,14 @@ function serializeBlock(block: any, tempFiles: string[]): string {
     case "tool_use":
       return `[Tool call: ${block.name}\nInput: ${JSON.stringify(block.input ?? {}, null, 2)}]`
     case "tool_result": {
+      // Truncate large tool results — cap at 4000 chars to prevent context explosion.
       const content = Array.isArray(block.content)
         ? block.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
         : String(block.content ?? "")
-      return `[Tool result (id=${block.tool_use_id}): ${content}]`
+      const truncated = content.length > 4000
+        ? content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`
+        : content
+      return `[Tool result (id=${block.tool_use_id}): ${truncated}]`
     }
     case "thinking":
       return ""
@@ -133,11 +137,13 @@ function cleanupTempFiles(tempFiles: string[]) {
 
 // ── Response normalization ───────────────────────────────────────────────────
 
-// If the model used send_message tools, it may output verbose text before
-// NO_REPLY. openclaw's isSilentReplyText already handles "ends with NO_REPLY",
-// but we normalize to just "NO_REPLY" for a clean session history.
+// If the agent used the message tool it may output verbose text before NO_REPLY.
+// openclaw's isSilentReplyText handles "ends with NO_REPLY", but we normalize to
+// just "NO_REPLY" for a clean session history.
+// If the agent produced no text (maxTurns exhausted or empty run), return "..."
+// so openclaw shows something rather than silence.
 function normalizeResponse(text: string): string {
-  if (!text) return "NO_REPLY"
+  if (!text || !text.trim()) return "..."
   const trimmed = text.trimEnd()
   if (trimmed.endsWith("NO_REPLY")) return "NO_REPLY"
   return text
@@ -147,7 +153,7 @@ function normalizeResponse(text: string): string {
 
 function buildQueryOptions(model: "sonnet" | "opus" | "haiku", partial?: boolean) {
   return {
-    maxTurns: 15, // enough for multi-message sends; keeps latency reasonable
+    maxTurns: 50,
     model,
     pathToClaudeCodeExecutable: claudeExecutable,
     ...(partial ? { includePartialMessages: true } : {}),
@@ -245,28 +251,62 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       }
 
       // ── Streaming ──────────────────────────────────────────────────────────
+      // Emit message_start immediately before the agent run so the client sees
+      // an active stream from the first byte — prevents HTTP timeouts during
+      // long multi-turn tool work. Text deltas stream in real-time.
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         async start(controller) {
+          const messageId = `msg_${Date.now()}`
+
+          const sse = (event: string, data: object) => {
+            try {
+              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+            } catch {}
+          }
+
           try {
             const heartbeat = setInterval(() => {
               try { controller.enqueue(encoder.encode(": ping\n\n")) } catch { clearInterval(heartbeat) }
             }, 15_000)
 
-            // Collect all text across the full multi-turn agent run, then emit
-            // a single clean SSE sequence. This avoids out-of-order SSE events
-            // that confuse openclaw's parser.
+            sse("message_start", {
+              type: "message_start",
+              message: {
+                id: messageId,
+                type: "message",
+                role: "assistant",
+                content: [],
+                model: body.model,
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 }
+              }
+            })
+            sse("content_block_start", {
+              type: "content_block_start",
+              index: 0,
+              content_block: { type: "text", text: "" }
+            })
+
+            // Stream text deltas in real-time as the agent produces them.
+            // Accumulate into fullText for normalization at the end.
             let fullText = ""
-            let messageId = `msg_${Date.now()}`
 
             try {
               for await (const message of query({ prompt, options: buildQueryOptions(model, true) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
-                  if (ev.type === "message_start") {
-                    messageId = ev.message?.id || messageId
-                  } else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                    fullText += ev.delta.text ?? ""
+                  if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                    const chunk = ev.delta.text ?? ""
+                    if (chunk) {
+                      fullText += chunk
+                      sse("content_block_delta", {
+                        type: "content_block_delta",
+                        index: 0,
+                        delta: { type: "text_delta", text: chunk }
+                      })
+                    }
                   }
                 }
               }
@@ -275,22 +315,43 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               cleanupTempFiles(tempFiles)
             }
 
-            fullText = normalizeResponse(fullText)
-            claudeLog("proxy.stream.done", { reqId, len: fullText.length })
+            // Normalize after the full run: if text ends with NO_REPLY, collapse
+            // it; if empty (maxTurns exhausted), emit the fallback "...".
+            const normalized = normalizeResponse(fullText)
+            claudeLog("proxy.stream.done", { reqId, len: fullText.length, normalized: normalized !== fullText })
 
-            const sse = (event: string, data: object) =>
-              controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
+            if (normalized !== fullText) {
+              // The accumulated deltas were already sent raw. We need to send
+              // a correction delta: clear what was sent and resend the normalized
+              // form. The cleanest approach is to send one more delta with the
+              // difference, but SSE text streams are append-only. Instead, send
+              // a terminal delta that replaces — openclaw accumulates all deltas,
+              // so we emit a negative-length correction by sending a stop and a
+              // fresh block with only the normalized text.
+              //
+              // Practical note: "NO_REPLY" is the main case. openclaw checks
+              // trimEnd().endsWith("NO_REPLY") on the full accumulated text, so
+              // even if we streamed "...\nNO_REPLY" it will still be treated as
+              // silent. We just need to make sure we don't emit an extra delta
+              // for the empty-text case since we already streamed nothing.
+              if (!fullText || !fullText.trim()) {
+                // Agent produced no text at all — send the "..." fallback now.
+                sse("content_block_delta", {
+                  type: "content_block_delta",
+                  index: 0,
+                  delta: { type: "text_delta", text: normalized }
+                })
+              }
+              // If normalized === "NO_REPLY" and we already streamed the raw text,
+              // openclaw will still handle it correctly via its endsWith check.
+            }
 
-            sse("message_start", {
-              type: "message_start",
-              message: { id: messageId, type: "message", role: "assistant", content: [],
-                model: body.model, stop_reason: null, stop_sequence: null,
-                usage: { input_tokens: 0, output_tokens: 0 } }
-            })
-            sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
-            sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: fullText } })
             sse("content_block_stop", { type: "content_block_stop", index: 0 })
-            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: fullText.length } })
+            sse("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: "end_turn", stop_sequence: null },
+              usage: { output_tokens: fullText.length }
+            })
             sse("message_stop", { type: "message_stop" })
             controller.close()
 
@@ -298,9 +359,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             claudeLog("proxy.stream.error", { reqId, error: error instanceof Error ? error.message : String(error) })
             cleanupTempFiles(tempFiles)
             try {
-              controller.enqueue(encoder.encode(
-                `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" } })}\n\n`
-              ))
+              sse("error", {
+                type: "error",
+                error: { type: "api_error", message: error instanceof Error ? error.message : "Unknown error" }
+              })
               controller.close()
             } catch {}
           }
