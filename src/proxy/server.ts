@@ -41,6 +41,37 @@ function resolveClaudeExecutable(): string {
 
 const claudeExecutable = resolveClaudeExecutable()
 
+// ── Concurrency control ──────────────────────────────────────────────────────
+// Limits simultaneous Claude SDK sessions to prevent resource exhaustion.
+
+const MAX_CONCURRENT = parseInt(process.env.CLAUDE_PROXY_MAX_CONCURRENT ?? "5", 10)
+
+class RequestQueue {
+  private active = 0
+  private waiting: Array<() => void> = []
+
+  get activeCount() { return this.active }
+  get waitingCount() { return this.waiting.length }
+
+  async acquire(): Promise<void> {
+    if (this.active < MAX_CONCURRENT) {
+      this.active++
+      return
+    }
+    return new Promise<void>((resolve) => {
+      this.waiting.push(() => { this.active++; resolve() })
+    })
+  }
+
+  release(): void {
+    this.active--
+    const next = this.waiting.shift()
+    if (next) next()
+  }
+}
+
+const requestQueue = new RequestQueue()
+
 function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
   if (model.includes("opus")) return "opus"
   if (model.includes("haiku")) return "haiku"
@@ -253,6 +284,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     const requestId = c.req.header("x-request-id") ?? `req_${randomBytes(12).toString("hex")}`
     c.header("x-request-id", requestId)
     c.header("request-id", requestId)
+    // Echo back Anthropic-standard headers
+    c.header("anthropic-version", "2024-10-22")
+    const betaHeader = c.req.header("anthropic-beta")
+    if (betaHeader) c.header("anthropic-beta", betaHeader)
     await next()
     const ms = Date.now() - start
     claudeLog("proxy.http", { method: c.req.method, path: c.req.path, status: c.res.status, ms, requestId })
@@ -263,7 +298,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     service: "claude-max-proxy",
     version: PROXY_VERSION,
     format: "anthropic",
-    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions"]
+    endpoints: ["/v1/messages", "/v1/models", "/v1/chat/completions"],
+    queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT }
   }))
 
   const MODELS = [
@@ -330,7 +366,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       // Extended thinking: extract budget_tokens from thinking parameter
       const maxThinkingTokens = body.thinking?.type === "enabled" ? body.thinking.budget_tokens : undefined
 
-      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode, ...(maxThinkingTokens ? { maxThinkingTokens } : {}) })
+      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode, ...(maxThinkingTokens ? { maxThinkingTokens } : {}), queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
+
+      // Acquire a slot in the concurrency queue
+      await requestQueue.acquire()
 
       const tempFiles: string[] = []
 
@@ -384,6 +423,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         } finally {
           clearTimeout(timeout)
           cleanupTempFiles(tempFiles)
+          requestQueue.release()
         }
 
         if (clientToolMode) {
@@ -421,6 +461,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const readable = new ReadableStream({
         async start(controller) {
           const messageId = `msg_${Date.now()}`
+          let queueReleased = false
+          const releaseQueue = () => { if (!queueReleased) { queueReleased = true; requestQueue.release() } }
 
           const sse = (event: string, data: object) => {
             try {
@@ -458,6 +500,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 clearInterval(heartbeat)
                 clearTimeout(timeout)
                 cleanupTempFiles(tempFiles)
+                releaseQueue()
               }
 
               const { toolCalls, textBefore } = parseToolUse(fullText)
@@ -511,6 +554,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               clearInterval(heartbeat)
               clearTimeout(timeout)
               cleanupTempFiles(tempFiles)
+              releaseQueue()
             }
 
             claudeLog("proxy.stream.done", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
@@ -530,6 +574,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
           } catch (error) {
             clearTimeout(timeout)
+            releaseQueue()
             const isAbort = error instanceof Error && error.name === "AbortError"
             const errMsg = isAbort ? "Request timeout" : (error instanceof Error ? error.message : "Unknown error")
             const errType = isAbort ? "timeout_error" : "api_error"

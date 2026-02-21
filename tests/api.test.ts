@@ -31,6 +31,9 @@ describe("GET /", () => {
     expect(body.version).toBeDefined()
     expect(body.format).toBe("anthropic")
     expect(body.endpoints).toBeArray()
+    expect(body.queue).toBeDefined()
+    expect(typeof body.queue.active).toBe("number")
+    expect(typeof body.queue.max).toBe("number")
   })
 })
 
@@ -208,6 +211,22 @@ describe("Request ID", () => {
     })
     expect(res.headers.get("x-request-id")).toBe("test-id-123")
     expect(res.headers.get("request-id")).toBe("test-id-123")
+  })
+})
+
+// ── Anthropic headers ────────────────────────────────────────────────────────
+
+describe("Anthropic headers", () => {
+  test("includes anthropic-version header", async () => {
+    const res = await req("/")
+    expect(res.headers.get("anthropic-version")).toBe("2024-10-22")
+  })
+
+  test("echoes back anthropic-beta header", async () => {
+    const res = await req("/", {
+      headers: { "anthropic-beta": "extended-thinking-2025-04-11" }
+    })
+    expect(res.headers.get("anthropic-beta")).toBe("extended-thinking-2025-04-11")
   })
 })
 
