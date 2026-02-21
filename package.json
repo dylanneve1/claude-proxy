@@ -1,6 +1,6 @@
 {
   "name": "claude-proxy",
-  "version": "2.0.0",
+  "version": "1.0.0",
   "description": "Claude Max proxy for openclaw — translates Anthropic Messages API to Claude Agent SDK, with native Telegram multi-message support via openclaw gateway",
   "type": "module",
   "main": "./src/proxy/server.ts",
