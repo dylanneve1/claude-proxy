@@ -11,8 +11,6 @@ import { tmpdir } from "os"
 import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
-import { createMcpServer, type McpServerState } from "../mcpTools"
-
 // Base62 ID generator — matches Anthropic's real ID format (e.g. msg_01XFDUDYJgAACzvnptvVoYEL)
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 function generateId(prefix: string, length = 24): string {
@@ -28,12 +26,6 @@ const PROXY_VERSION: string = (() => {
     return pkg.version ?? "unknown"
   } catch { return "unknown" }
 })()
-
-// Only block tools that add noise — everything else (Read, Write, Edit, Bash,
-// Glob, Grep, WebFetch, WebSearch) uses Claude Code's robust built-in implementations.
-const BLOCKED_BUILTIN_TOOLS = ["TodoWrite", "NotebookEdit"]
-
-const MCP_SERVER_NAME = "opencode"
 
 function resolveClaudeExecutable(): string {
   try {
@@ -158,26 +150,9 @@ function cleanupTempFiles(tempFiles: string[]) {
 }
 
 // ── Client tool-use support ──────────────────────────────────────────────────
-// When the caller provides tool definitions (e.g. Claude Code, LangChain, etc.)
-// we switch to single-turn mode: inject tool defs into the system prompt, run
-// one LLM turn, parse <tool_use> blocks from the output, and return them as
-// proper Anthropic tool_use content blocks.
-//
-// We stay in agent mode (multi-turn, built-in + MCP tools) when:
-//   - No tools in the request, OR
-//   - The request has markers indicating the agent manages its own tool loop
-
-function isClientToolMode(body: any): boolean {
-  if (!body.tools?.length) return false
-  if (body.messages?.some((m: any) =>
-    Array.isArray(m.content) && m.content.some((b: any) => b.type === "tool_result")
-  )) return true
-  const sysText = Array.isArray(body.system)
-    ? body.system.filter((b: any) => b.type === "text").map((b: any) => b.text).join(" ")
-    : String(body.system ?? "")
-  if (sysText.includes("conversation_label") || sysText.includes("chat id:")) return false
-  return true
-}
+// The proxy never uses Claude Code's built-in tools. All tools come from the
+// API caller. Tool definitions are injected into the system prompt; <tool_use>
+// XML blocks in the output are parsed back into Anthropic tool_use content.
 
 function buildClientToolsPrompt(tools: any[]): string {
   const defs = tools.map((t: any) => {
@@ -237,46 +212,32 @@ function roughTokens(text: string): number {
 }
 
 // ── Query options builder ────────────────────────────────────────────────────
+// Always runs with all built-in tools disabled (tools: []) and maxTurns: 1.
+// The proxy is a pure API translation layer — tool definitions come from the
+// caller and are injected into the system prompt. No MCP servers, no agent loop.
 
 function buildQueryOptions(
   model: "sonnet" | "opus" | "haiku",
   opts: {
     partial?: boolean
-    clientToolMode?: boolean
     systemPrompt?: string
-    mcpState?: McpServerState
     abortController?: AbortController
     thinking?: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" }
   } = {}
 ) {
-  const base = {
+  return {
     model,
     pathToClaudeCodeExecutable: claudeExecutable,
     permissionMode: "bypassPermissions" as const,
     allowDangerouslySkipPermissions: true,
     persistSession: false,
     settingSources: [],
+    tools: [] as string[],
+    maxTurns: 1,
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
     ...(opts.thinking ? { thinking: opts.thinking } : {}),
     ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
-    disallowedTools: [...BLOCKED_BUILTIN_TOOLS],
-  }
-
-  if (opts.clientToolMode) {
-    // Disable ALL built-in tools — the caller manages its own tool loop.
-    // Tool definitions are already baked into the systemPrompt.
-    return {
-      ...base,
-      maxTurns: 1,
-      tools: [] as string[],
-    }
-  }
-
-  return {
-    ...base,
-    maxTurns: 200,
-    mcpServers: { [MCP_SERVER_NAME]: createMcpServer(opts.mcpState) }
   }
 }
 
@@ -396,8 +357,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       const model = mapModelToClaudeModel(body.model || "sonnet")
       const stream = body.stream ?? false
-      const clientToolMode = isClientToolMode(body)
-      const mcpState: McpServerState = { messageSent: false }
+      const hasTools = body.tools?.length > 0
       const abortController = new AbortController()
       const timeout = setTimeout(() => abortController.abort(), finalConfig.requestTimeoutMs)
 
@@ -423,34 +383,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       }
 
       // Build the prompt from messages. The SDK's query() takes a single prompt
-      // string. To avoid the model continuing a "Human:/Assistant:" format in its
-      // response, we use neutral delimiters and only the last user message as the
-      // primary prompt when there's minimal context.
+      // string, so multi-turn conversations are serialized with XML-delimited
+      // turns. Prior turns go into the system prompt as context, the last user
+      // message becomes the prompt.
       const messages = body.messages as Array<{ role: string; content: string | Array<any> }>
 
       let prompt: string
       let systemPrompt: string | undefined
+      const toolsSection = hasTools ? buildClientToolsPrompt(body.tools) : ""
 
-      if (clientToolMode) {
-        // Client tool mode: serialize all messages as context, inject tools
-        const conversationParts = messages
-          .map((m) => {
-            const tag = m.role === "assistant" ? "assistant_message" : "user_message"
-            return `<${tag}>\n${serializeContent(m.content, tempFiles)}\n</${tag}>`
-          })
-          .join("\n\n")
-        const toolsSection = buildClientToolsPrompt(body.tools)
-        systemPrompt = systemContext
-          ? `${systemContext}${toolsSection}`
-          : toolsSection
-        prompt = conversationParts
-      } else if (messages.length === 1) {
-        // Single message: pass directly as prompt (most common case)
-        systemPrompt = systemContext || undefined
+      if (messages.length === 1) {
+        systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
         prompt = serializeContent(messages[0]!.content, tempFiles)
       } else {
-        // Multi-turn: build conversation context with XML-delimited turns.
-        // Put prior turns in system prompt as context, last user message as prompt.
         const lastMsg = messages[messages.length - 1]!
         const priorMsgs = messages.slice(0, -1)
 
@@ -465,11 +410,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         const contextSection = contextParts
           ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>`
           : ""
-        systemPrompt = (baseSystem + contextSection).trim() || undefined
+        systemPrompt = (baseSystem + contextSection + toolsSection).trim() || undefined
         prompt = serializeContent(lastMsg.content, tempFiles)
       }
 
-      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, clientToolMode, ...(thinking ? { thinking: thinking.type } : {}), queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
+      claudeLog("proxy.request", { reqId, model, stream, msgs: body.messages?.length, hasTools, ...(thinking ? { thinking: thinking.type } : {}), queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
 
       // Acquire a slot in the concurrency queue — all code after this MUST
       // release via the try/finally blocks in both streaming and non-streaming paths.
@@ -478,18 +423,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       // ── Non-streaming ──────────────────────────────────────────────────────
       if (!stream) {
         let fullText = ""
-        let lastCleanText = ""
         try {
-          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, clientToolMode, systemPrompt, mcpState, abortController, thinking }) })) {
+          for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: false, systemPrompt, abortController, thinking }) })) {
             if (message.type === "assistant") {
               let turnText = ""
-              let hasToolUse = false
               for (const block of message.message.content) {
                 if (block.type === "text") turnText += block.text
-                if (block.type === "tool_use") hasToolUse = true
-              }
-              if (!hasToolUse && turnText) {
-                lastCleanText = turnText
               }
               fullText = turnText
             }
@@ -499,10 +438,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           cleanupTempFiles(tempFiles)
           requestQueue.release()
         }
-        // In agent mode, prefer the last turn that had no tool_use
-        if (!clientToolMode && lastCleanText) fullText = lastCleanText
 
-        if (clientToolMode) {
+        if (hasTools) {
           const { toolCalls, textBefore } = parseToolUse(fullText)
           const content: any[] = []
           if (textBefore) content.push({ type: "text", text: textBefore })
@@ -518,11 +455,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           })
         }
 
-        // If the MCP message tool delivered anything, suppress the proxy's
-        // own text response so the client doesn't double-deliver.
-        if (mcpState.messageSent) fullText = "NO_REPLY"
         if (!fullText || !fullText.trim()) fullText = "..."
-        claudeLog("proxy.response", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
+        claudeLog("proxy.response", { reqId, len: fullText.length })
         return c.json({
           id: generateId("msg_"),
           type: "message", role: "assistant",
@@ -564,11 +498,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
             })
 
-            // ── Client tool mode: buffer → emit blocks at end ─────────────
-            if (clientToolMode) {
+            if (hasTools) {
+              // ── With tools: buffer output, parse tool_use blocks at end ──
               let fullText = ""
               try {
-                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, clientToolMode: true, systemPrompt, abortController, thinking }) })) {
+                for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
                   if (message.type === "stream_event") {
                     const ev = message.event as any
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -613,17 +547,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               return
             }
 
-            // ── Agent mode: real-time streaming ─────────────────────────
-            // Forward text deltas to the client as they arrive from the SDK.
-            // For single-turn (most chat requests), this gives true token-by-
-            // token streaming. For multi-turn (agent tool use), the client
-            // sees all turns' text streamed in real-time.
+            // ── No tools: stream text deltas directly ─────────────────────
             sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
 
             let fullText = ""
             let hasStreamed = false
             try {
-              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, mcpState, abortController, thinking }) })) {
+              for await (const message of query({ prompt, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
                 if (message.type === "stream_event") {
                   const ev = message.event as any
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
@@ -643,11 +573,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               releaseQueue()
             }
 
-            claudeLog("proxy.stream.done", { reqId, len: fullText.length, messageSent: mcpState.messageSent })
+            claudeLog("proxy.stream.done", { reqId, len: fullText.length })
 
-            if (mcpState.messageSent) {
-              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\nNO_REPLY" } })
-            } else if (!hasStreamed) {
+            if (!hasStreamed) {
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 
