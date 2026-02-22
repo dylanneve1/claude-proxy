@@ -3,7 +3,6 @@ import { z } from "zod"
 import { createPrivateKey, createPublicKey, sign, randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { execSync } from "node:child_process"
 
 // ── Gateway helpers ──────────────────────────────────────────────────────────
 
@@ -158,35 +157,6 @@ export function createMcpServer(state: McpServerState = { messageSent: false }) 
     name: "opencode",
     version: "1.0.0",
     tools: [
-      // exec: fallback for callers whose system prompt references "exec" instead of
-      // Claude Code's built-in "Bash" tool.  Maps to child_process.execSync.
-      tool(
-        "exec",
-        "Execute a shell command and return its output. Use this for running scripts, system commands, and file operations.",
-        {
-          command: z.string().describe("The shell command to execute"),
-          timeout: z.number().optional().describe("Timeout in milliseconds (default 120000)"),
-        },
-        async (args) => {
-          try {
-            const output = execSync(args.command, {
-              encoding: "utf-8",
-              timeout: args.timeout ?? 120_000,
-              maxBuffer: 10 * 1024 * 1024,
-              cwd: "/tmp",
-            })
-            return { content: [{ type: "text", text: output || "(no output)" }] }
-          } catch (error: any) {
-            const stderr = error.stderr ? String(error.stderr) : ""
-            const stdout = error.stdout ? String(error.stdout) : ""
-            const msg = error.message ?? "Command failed"
-            return {
-              content: [{ type: "text", text: `Error: ${msg}\n${stderr}\n${stdout}`.trim() }],
-              isError: true
-            }
-          }
-        }
-      ),
       tool(
         "message",
         "Send a message or file to a chat. Provide `to` (chat ID from conversation_label, e.g. '-1001426819337'), and either `message` (text) or `filePath`/`path`/`media` (absolute path to a file). Write files to /tmp/ before sending.",
