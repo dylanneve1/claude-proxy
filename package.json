@@ -22,7 +22,7 @@
     "bun": ">=1.0.0"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.25",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.50",
     "hono": "^4.11.4"
   },
   "devDependencies": {
