@@ -435,8 +435,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         // Client tool mode: serialize all messages as context, inject tools
         const conversationParts = messages
           .map((m) => {
-            const label = m.role === "assistant" ? "[assistant]" : "[user]"
-            return `${label}\n${serializeContent(m.content, tempFiles)}`
+            const tag = m.role === "assistant" ? "assistant_message" : "user_message"
+            return `<${tag}>\n${serializeContent(m.content, tempFiles)}\n</${tag}>`
           })
           .join("\n\n")
         const toolsSection = buildClientToolsPrompt(body.tools)
@@ -449,15 +449,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         systemPrompt = systemContext || undefined
         prompt = serializeContent(messages[0]!.content, tempFiles)
       } else {
-        // Multi-turn: build conversation context with neutral delimiters.
+        // Multi-turn: build conversation context with XML-delimited turns.
         // Put prior turns in system prompt as context, last user message as prompt.
         const lastMsg = messages[messages.length - 1]!
         const priorMsgs = messages.slice(0, -1)
 
         const contextParts = priorMsgs
           .map((m) => {
-            const label = m.role === "assistant" ? "[assistant]" : "[user]"
-            return `${label}\n${serializeContent(m.content, tempFiles)}`
+            const tag = m.role === "assistant" ? "assistant_message" : "user_message"
+            return `<${tag}>\n${serializeContent(m.content, tempFiles)}\n</${tag}>`
           })
           .join("\n\n")
 
