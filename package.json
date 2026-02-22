@@ -1,11 +1,11 @@
 {
   "name": "claude-sdk-proxy",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Anthropic Messages API proxy backed by Claude Agent SDK — use Claude Max with any API client",
   "type": "module",
   "main": "./src/proxy/server.ts",
   "bin": {
-    "claude-sdk-proxy": "./bin/claude-sdk-proxy.ts"
+    "claude-sdk-proxy": "./bin/claude-sdk-proxy.js"
   },
   "exports": {
     ".": "./src/proxy/server.ts"
