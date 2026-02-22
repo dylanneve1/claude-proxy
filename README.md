@@ -211,7 +211,21 @@ bun run typecheck
 | `*haiku*` | haiku |
 | anything else | sonnet |
 
-## systemd (Linux auto-start)
+## Deploying on a Server
+
+Expose the proxy as an HTTPS endpoint so you can use it from chat apps like TypingMind, ChatWise, or any Anthropic-compatible client.
+
+### 1. Install & configure the proxy
+
+```bash
+git clone https://github.com/dylanneve1/claude-proxy
+cd claude-proxy
+bun install
+```
+
+### 2. Set up systemd
+
+Create `~/.config/systemd/user/claude-proxy.service`:
 
 ```ini
 [Unit]
@@ -222,13 +236,69 @@ After=network.target
 Type=simple
 WorkingDirectory=/path/to/claude-proxy
 ExecStart=/home/user/.bun/bin/bun run proxy
+Environment=PATH=/home/user/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_PROXY_HOST=0.0.0.0
+Environment=CLAUDE_PROXY_API_KEY=your-secret-api-key
 Restart=always
 RestartSec=3
-Environment=CLAUDE_PROXY_PORT=3456
 
 [Install]
 WantedBy=default.target
 ```
+
+- `CLAUDE_PROXY_HOST=0.0.0.0` binds to all interfaces (required for external access)
+- `CLAUDE_PROXY_API_KEY` protects the endpoint — clients must send this via `x-api-key` or `Authorization: Bearer` header
+
+Generate a random key:
+
+```bash
+openssl rand -hex 32
+```
+
+Enable and start:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now claude-proxy
+```
+
+### 3. Add HTTPS with Caddy
+
+A reverse proxy with auto TLS is the easiest way to get HTTPS. Get a free domain from [duckdns.org](https://www.duckdns.org) and point it at your server IP.
+
+Install Caddy:
+
+```bash
+sudo apt install caddy
+```
+
+Edit `/etc/caddy/Caddyfile`:
+
+```
+yourdomain.duckdns.org {
+    reverse_proxy localhost:3456 {
+        flush_interval -1
+    }
+}
+```
+
+`flush_interval -1` ensures SSE streaming responses are forwarded immediately without buffering.
+
+```bash
+sudo systemctl reload caddy
+```
+
+Caddy automatically provisions a Let's Encrypt TLS certificate.
+
+### 4. Connect a chat app
+
+Use your endpoint in any Anthropic-compatible chat app:
+
+| Setting | Value |
+|---------|-------|
+| **Base URL** | `https://yourdomain.duckdns.org` |
+| **API Key** | Your `CLAUDE_PROXY_API_KEY` value |
+| **Model** | `claude-opus-4-6`, `claude-sonnet-4-6`, or `claude-haiku-4-5-20251001` |
 
 ## License
 

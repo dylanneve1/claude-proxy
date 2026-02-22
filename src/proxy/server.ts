@@ -385,7 +385,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       }
 
       const model = mapModelToClaudeModel(body.model || "sonnet")
-      const stream = body.stream ?? true
+      const stream = body.stream ?? false
       const clientToolMode = isClientToolMode(body)
       const mcpState: McpServerState = { messageSent: false }
       const abortController = new AbortController()
