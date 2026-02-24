@@ -37,3 +37,4 @@ coverage/
 # npm pack output
 *.tgz
 claude-proxy.db
+session-store.json
