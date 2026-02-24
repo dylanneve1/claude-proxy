@@ -966,6 +966,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
         if (hasTools) {
           const { toolCalls, textBefore } = parseToolUse(fullText)
+          // Debug: log when tools were expected but none parsed
+          if (toolCalls.length === 0 && fullText.length > 0) {
+            logDebug("tool_parse.no_match", {
+              reqId,
+              outputLen: fullText.length,
+              textPreview: fullText.slice(0, 500),
+              hasToolUseTag: fullText.includes("<tool_use>"),
+              hasFunctionCalls: fullText.includes("<function_calls>"),
+              hasInvoke: fullText.includes("<invoke"),
+              hasAntmlInvoke: fullText.includes("antml:invoke"),
+            })
+          }
           const content: any[] = []
           if (textBefore) content.push({ type: "text", text: textBefore })
           for (const tc of toolCalls) content.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.input })
@@ -1178,6 +1190,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
               traceStore.phase(reqId, "responding")
               const { toolCalls, textBefore } = parseToolUse(fullText)
+
+              // Debug: log when tools were expected but none parsed
+              if (toolCalls.length === 0 && fullText.length > 0) {
+                logDebug("tool_parse.no_match_stream", {
+                  reqId,
+                  outputLen: fullText.length,
+                  textPreview: fullText.slice(0, 500),
+                  hasToolUseTag: fullText.includes("<tool_use>"),
+                  hasFunctionCalls: fullText.includes("<function_calls>"),
+                  hasInvoke: fullText.includes("<invoke"),
+                  hasAntmlInvoke: fullText.includes("antml:invoke"),
+                })
+              }
 
               let blockIdx = 0
               const textContent = toolCalls.length === 0 ? (fullText || "...") : textBefore
