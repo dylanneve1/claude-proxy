@@ -699,14 +699,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
         const contextParts = priorMsgs
           .map((m) => {
-            const role = m.role === "assistant" ? "Assistant" : "User"
-            return `[${role}]\n${serializeContent(m.content)}`
+            const role = m.role === "assistant" ? "assistant" : "user"
+            return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
           })
           .join("\n\n")
 
         const baseSystem = systemContext || ""
         const contextSection = contextParts
-          ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---`
+          ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n`
           : ""
         systemPrompt = (baseSystem + contextSection).trim() || undefined
 
@@ -871,12 +871,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             const priorMsgs = messages.slice(0, -1)
             const contextParts = priorMsgs
               .map((m) => {
-                const role = m.role === "assistant" ? "Assistant" : "User"
-                return `[${role}]\n${serializeContent(m.content)}`
+                const role = m.role === "assistant" ? "assistant" : "user"
+                return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
               })
               .join("\n\n")
             const baseSystem = systemContext || ""
-            const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
+            const contextSection = contextParts ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n` : ""
             const fallbackSystem = (baseSystem + contextSection).trim() || undefined
             const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
               ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
@@ -1154,12 +1154,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   const priorMsgs = messages.slice(0, -1)
                   const contextParts = priorMsgs
                     .map((m) => {
-                      const role = m.role === "assistant" ? "Assistant" : "User"
-                      return `[${role}]\n${serializeContent(m.content)}`
+                      const role = m.role === "assistant" ? "assistant" : "user"
+                      return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
                     })
                     .join("\n\n")
                   const baseSystem = systemContext || ""
-                  const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
+                  const contextSection = contextParts ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n` : ""
                   const fallbackSystem = (baseSystem + contextSection).trim() || undefined
                   const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
                     ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
@@ -1296,12 +1296,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 const priorMsgs = messages.slice(0, -1)
                 const contextParts = priorMsgs
                   .map((m) => {
-                    const role = m.role === "assistant" ? "Assistant" : "User"
-                    return `[${role}]\n${serializeContent(m.content)}`
+                    const role = m.role === "assistant" ? "assistant" : "user"
+                    return `<turn role="${role}">\n${serializeContent(m.content)}\n</turn>`
                   })
                   .join("\n\n")
                 const baseSystem = systemContext || ""
-                const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
+                const contextSection = contextParts ? `\n\n<conversation_history>\n${contextParts}\n</conversation_history>\n` : ""
                 const fallbackSystem = (baseSystem + contextSection).trim() || undefined
                 const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
                   ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
