@@ -7,6 +7,7 @@ import { DEFAULT_PROXY_CONFIG } from "./types"
 import { logInfo, logWarn, logError, logDebug, LOG_DIR } from "../logger"
 import { traceStore } from "../trace"
 import { sessionStore } from "../session-store"
+import { createToolMcpServer } from "../mcpTools"
 import { execSync } from "child_process"
 import { existsSync, writeFileSync, readFileSync, readdirSync } from "fs"
 import { randomBytes } from "crypto"
@@ -195,110 +196,17 @@ function createSDKUserMessage(content: Array<any>, sessionId?: string): AsyncIte
 }
 
 
-// ── Client tool-use support ──────────────────────────────────────────────────
+// ── Client tool-use support (native MCP) ────────────────────────────────────
+// Tool definitions from the client are converted to native MCP tools via
+// createToolMcpServer(). The SDK generates proper tool_use content blocks
+// instead of text-based XML. canUseTool denies all execution since the
+// client handles tool execution.
 
-function buildClientToolsPrompt(tools: any[]): string {
-  const defs = tools.map((t: any) => {
-    const schema = t.input_schema ? `\nInput schema:\n${JSON.stringify(t.input_schema, null, 2)}` : ""
-    return `### ${t.name}\n${t.description ?? ""}${schema}`
-  }).join("\n\n")
-  return `\n\n## Available Tools\n\nTo call a tool, output a <tool_use> block:\n\n` +
-    `<tool_use>\n{"name": "TOOL_NAME", "input": {ARGUMENTS}}\n</tool_use>\n\n` +
-    `- You may write reasoning text before the block\n` +
-    `- Call multiple tools by including multiple <tool_use> blocks\n` +
-    `- Each block must be valid JSON with "name" and "input" keys\n\n` +
-    defs
-}
-
-interface ToolCall { id: string; name: string; input: unknown }
-
-function parseToolUse(text: string): { toolCalls: ToolCall[]; textBefore: string } {
-  const calls: ToolCall[] = []
-  let firstIdx = -1
-
-  const xmlRegex = /<tool_use>([\s\S]*?)<\/tool_use>/g
-  let m: RegExpExecArray | null
-  while ((m = xmlRegex.exec(text)) !== null) {
-    if (firstIdx < 0) firstIdx = m.index
-    try {
-      const raw = m[1]!.trim()
-      let p: any
-      try { p = JSON.parse(raw) } catch {
-        // Repair: models often emit raw newlines in heredocs/multiline commands
-        // which are invalid inside JSON strings. Escape them only inside quoted values.
-        let fixed = "", inStr = false, esc = false
-        for (const ch of raw) {
-          if (esc) { fixed += ch; esc = false; continue }
-          if (ch === "\\") { esc = true; fixed += ch; continue }
-          if (ch === '"') { inStr = !inStr; fixed += ch; continue }
-          if (inStr && ch === "\n") { fixed += "\\n"; continue }
-          if (inStr && ch === "\r") { fixed += "\\r"; continue }
-          if (inStr && ch === "\t") { fixed += "\\t"; continue }
-          fixed += ch
-        }
-        p = JSON.parse(fixed)
-      }
-      calls.push({
-        id: generateId("toolu_"),
-        name: String(p.name ?? ""),
-        input: p.input ?? {}
-      })
-    } catch { /* skip malformed block */ }
-  }
-
-  if (calls.length === 0) {
-    const fcRegex = /<function_calls>([\s\S]*?)<\/function_calls>/g
-    while ((m = fcRegex.exec(text)) !== null) {
-      if (firstIdx < 0) firstIdx = m.index
-      try {
-        const parsed = JSON.parse(m[1]!.trim())
-        const items = Array.isArray(parsed) ? parsed : [parsed]
-        for (const p of items) {
-          if (p && typeof p.name === "string") {
-            calls.push({
-              id: generateId("toolu_"),
-              name: p.name,
-              input: p.input ?? p.parameters ?? {}
-            })
-          }
-        }
-      } catch { /* skip malformed block */ }
-    }
-  }
-
-  if (calls.length === 0) {
-    const invokeRegex = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/g
-    while ((m = invokeRegex.exec(text)) !== null) {
-      if (firstIdx < 0) firstIdx = m.index
-      const toolName = m[1]!
-      const body = m[2]!
-      const input: Record<string, any> = {}
-      const paramRegex = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g
-      let pm: RegExpExecArray | null
-      while ((pm = paramRegex.exec(body)) !== null) {
-        const val = pm[2]!.trim()
-        try { input[pm[1]!] = JSON.parse(val) } catch { input[pm[1]!] = val }
-      }
-      calls.push({ id: generateId("toolu_"), name: toolName, input })
-    }
-  }
-
-  if (calls.length === 0) {
-    const bracketRegex = /\[Tool call:\s*(\w+)\s*\nInput:\s*([\s\S]*?)\]/g
-    while ((m = bracketRegex.exec(text)) !== null) {
-      if (firstIdx < 0) firstIdx = m.index
-      try {
-        const input = JSON.parse(m[2]!.trim())
-        calls.push({
-          id: generateId("toolu_"),
-          name: m[1]!.trim(),
-          input
-        })
-      } catch { /* skip malformed block */ }
-    }
-  }
-
-  return { toolCalls: calls, textBefore: firstIdx > 0 ? text.slice(0, firstIdx).trim() : "" }
+// The SDK prefixes MCP tool names with "mcp__{server-name}__".
+// Strip this prefix so clients see the original tool names they sent.
+const MCP_TOOL_PREFIX = "mcp__proxy-tools__"
+function stripMcpPrefix(name: string): string {
+  return name.startsWith(MCP_TOOL_PREFIX) ? name.slice(MCP_TOOL_PREFIX.length) : name
 }
 
 function roughTokens(text: string): number {
@@ -351,6 +259,8 @@ function buildQueryOptions(
     abortController?: AbortController
     thinking?: { type: "adaptive" } | { type: "enabled"; budgetTokens?: number } | { type: "disabled" }
     resume?: string
+    mcpServers?: Record<string, any>
+    canUseTool?: (toolName: string, input: Record<string, unknown>, options: any) => Promise<any>
   } = {}
 ) {
   return {
@@ -360,13 +270,15 @@ function buildQueryOptions(
     allowDangerouslySkipPermissions: true,
     persistSession: true,
     settingSources: [],
-    tools: ["_proxy_noop_"] as string[],
+    tools: [] as string[],
     maxTurns: 1,
     ...(opts.partial ? { includePartialMessages: true } : {}),
     ...(opts.abortController ? { abortController: opts.abortController } : {}),
     ...(opts.thinking ? { thinking: opts.thinking } : {}),
     ...(opts.systemPrompt ? { systemPrompt: opts.systemPrompt } : {}),
     ...(opts.resume ? { resume: opts.resume } : {}),
+    ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
+    ...(opts.canUseTool ? { canUseTool: opts.canUseTool } : {}),
   }
 }
 
@@ -724,7 +636,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       let promptText: string  // text version for token counting / logging
       let systemPrompt: string | undefined
-      const toolsSection = hasTools ? buildClientToolsPrompt(body.tools) : ""
+
+      // Create MCP server for native tool calling (if client sent tools)
+      const mcpServer = hasTools ? createToolMcpServer(body.tools) : null
+      const mcpServers = mcpServer ? { "proxy-tools": mcpServer } : undefined
+      const canUseTool = hasTools
+        ? async () => ({ behavior: "deny" as const, message: "Tool execution handled by client" })
+        : undefined
 
       // ── Session resumption ─────────────────────────────────────────────
       // Derive conversation ID from: headers (explicit) or conversation_label
@@ -763,7 +681,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       promptText = serializeContent(lastMsg.content)
 
       if (isResuming && resumeSessionId) {
-        systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
+        systemPrompt = (systemContext || "").trim() || undefined
         if (lastMsgHasImages) {
           promptInput = createSDKUserMessage(buildNativeContent(lastMsg.content), resumeSessionId)
           logInfo("session.resume_with_images", { reqId, conversationId })
@@ -771,7 +689,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           promptInput = promptText
         }
       } else if (messages.length === 1) {
-        systemPrompt = ((systemContext || "") + toolsSection).trim() || undefined
+        systemPrompt = (systemContext || "").trim() || undefined
         promptInput = lastMsgHasImages
           ? createSDKUserMessage(buildNativeContent(lastMsg.content))
           : promptText
@@ -790,7 +708,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         const contextSection = contextParts
           ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---`
           : ""
-        systemPrompt = (baseSystem + contextSection + toolsSection).trim() || undefined
+        systemPrompt = (baseSystem + contextSection).trim() || undefined
 
         if (lastMsgHasImages) {
           promptInput = createSDKUserMessage(buildNativeContent(lastMsg.content))
@@ -863,7 +781,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       if (!stream) {
         let fullText = ""
         let capturedSessionId: string | undefined
-        const queryOpts = buildQueryOptions(model, { partial: false, systemPrompt, abortController, thinking, resume: resumeSessionId })
+        const queryOpts = buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers, canUseTool })
+        // For tool mode: capture native content blocks from stream events
+        const contentBlocks: any[] = []
+        let currentToolBlock: { id: string; name: string; jsonAccum: string } | null = null
+        let capturedStopReason: string | null = null
         try {
           traceStore.phase(reqId, "sdk_starting")
           let sdkEventCount = 0
@@ -875,7 +797,43 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (message.type === "system" && (message as any).subtype === "init") {
               capturedSessionId = (message as any).session_id
             }
-            if (message.type === "assistant") {
+            if (hasTools && message.type === "stream_event") {
+              const ev = (message as any).event as any
+              if (ev.type === "content_block_start") {
+                const cb = ev.content_block
+                if (cb?.type === "tool_use") {
+                  currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
+                } else if (cb?.type === "text") {
+                  contentBlocks.push({ type: "text", text: "" })
+                }
+              } else if (ev.type === "content_block_delta") {
+                if (ev.delta?.type === "text_delta") {
+                  const lastText = contentBlocks[contentBlocks.length - 1]
+                  if (lastText?.type === "text") {
+                    lastText.text += ev.delta.text ?? ""
+                  } else {
+                    contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
+                  }
+                  fullText += ev.delta.text ?? ""
+                } else if (ev.delta?.type === "input_json_delta" && currentToolBlock) {
+                  currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
+                }
+              } else if (ev.type === "content_block_stop") {
+                if (currentToolBlock) {
+                  let input: any = {}
+                  try { input = JSON.parse(currentToolBlock.jsonAccum) } catch {}
+                  contentBlocks.push({
+                    type: "tool_use",
+                    id: currentToolBlock.id,
+                    name: currentToolBlock.name,
+                    input,
+                  })
+                  currentToolBlock = null
+                }
+              } else if (ev.type === "message_delta") {
+                if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+              }
+            } else if (!hasTools && message.type === "assistant") {
               let turnText = ""
               for (const block of message.message.content) {
                 if (block.type === "text") turnText += block.text
@@ -919,13 +877,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               .join("\n\n")
             const baseSystem = systemContext || ""
             const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
-            const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
+            const fallbackSystem = (baseSystem + contextSection).trim() || undefined
             const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
               ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
               : serializeContent(fbLastMsg.content)
-            const fallbackOpts = buildQueryOptions(model, { partial: false, systemPrompt: fallbackSystem, abortController, thinking })
+            const fallbackOpts = buildQueryOptions(model, { partial: hasTools, systemPrompt: fallbackSystem, abortController, thinking, mcpServers, canUseTool })
 
             logInfo("session.fallback_full_context", { reqId, conversationId })
+            // Reset block accumulators for fallback
+            contentBlocks.length = 0
+            currentToolBlock = null
+            capturedStopReason = null
+            fullText = ""
             let sdkEventCount = 0
             for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
               sdkEventCount++
@@ -934,7 +897,38 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               if (message.type === "system" && (message as any).subtype === "init") {
                 capturedSessionId = (message as any).session_id
               }
-              if (message.type === "assistant") {
+              if (hasTools && message.type === "stream_event") {
+                const ev = (message as any).event as any
+                if (ev.type === "content_block_start") {
+                  const cb = ev.content_block
+                  if (cb?.type === "tool_use") {
+                    currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
+                  } else if (cb?.type === "text") {
+                    contentBlocks.push({ type: "text", text: "" })
+                  }
+                } else if (ev.type === "content_block_delta") {
+                  if (ev.delta?.type === "text_delta") {
+                    const lastText = contentBlocks[contentBlocks.length - 1]
+                    if (lastText?.type === "text") {
+                      lastText.text += ev.delta.text ?? ""
+                    } else {
+                      contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
+                    }
+                    fullText += ev.delta.text ?? ""
+                  } else if (ev.delta?.type === "input_json_delta" && currentToolBlock) {
+                    currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
+                  }
+                } else if (ev.type === "content_block_stop") {
+                  if (currentToolBlock) {
+                    let input: any = {}
+                    try { input = JSON.parse(currentToolBlock.jsonAccum) } catch {}
+                    contentBlocks.push({ type: "tool_use", id: currentToolBlock.id, name: currentToolBlock.name, input })
+                    currentToolBlock = null
+                  }
+                } else if (ev.type === "message_delta") {
+                  if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+                }
+              } else if (!hasTools && message.type === "assistant") {
                 let turnText = ""
                 for (const block of message.message.content) {
                   if (block.type === "text") turnText += block.text
@@ -953,7 +947,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           }
         } finally {
           clearStallTimer(); clearHardTimer()
-          // (temp files no longer used — images passed natively)
           requestQueue.release()
           logDebug("queue.released", {
             reqId,
@@ -965,26 +958,23 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         traceStore.phase(reqId, "responding")
 
         if (hasTools) {
-          const { toolCalls, textBefore } = parseToolUse(fullText)
-          // Debug: log when tools were expected but none parsed
-          if (toolCalls.length === 0 && fullText.length > 0) {
-            logDebug("tool_parse.no_match", {
-              reqId,
-              outputLen: fullText.length,
-              textPreview: fullText.slice(0, 500),
-              hasToolUseTag: fullText.includes("<tool_use>"),
-              hasFunctionCalls: fullText.includes("<function_calls>"),
-              hasInvoke: fullText.includes("<invoke"),
-              hasAntmlInvoke: fullText.includes("antml:invoke"),
-            })
-          }
-          const content: any[] = []
-          if (textBefore) content.push({ type: "text", text: textBefore })
-          for (const tc of toolCalls) content.push({ type: "tool_use", id: tc.id, name: tc.name, input: tc.input })
+          // Use native content blocks captured from stream events
+          const toolCallCount = contentBlocks.filter((b: any) => b.type === "tool_use").length
+          // Filter out empty text blocks
+          const content = contentBlocks.filter((b: any) => {
+            if (b.type === "text" && !b.text?.trim()) return false
+            return true
+          })
           if (content.length === 0) content.push({ type: "text", text: fullText || "..." })
-          const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn"
 
-          traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount: toolCalls.length })
+          const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
+
+          // Invalidate session when tool_use present — SDK session has stale history
+          if (toolCallCount > 0 && conversationId) {
+            sessionStore.invalidate(conversationId)
+          }
+
+          traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
 
           return c.json({
             id: generateId("msg_"),
@@ -1078,8 +1068,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             })
 
             if (hasTools) {
-              // ── With tools: buffer output, parse tool_use blocks at end ──
+              // ── With tools: forward native SDK stream events directly as SSE ──
               let fullText = ""
+              let blockIdx = 0
+              let toolCallCount = 0
+              let capturedStopReason: string | null = null
+              let hasEmittedAnyBlock = false
               let sdkEventCount = 0
               let lastEventAt = Date.now()
               const stallLog = setInterval(() => {
@@ -1087,28 +1081,51 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 traceStore.stall(reqId, stallMs)
               }, 15_000)
               let capturedSessionId: string | undefined
+
+              // Helper to forward a stream event directly as SSE
+              const forwardStreamEvent = (ev: any) => {
+                if (ev.type === "content_block_start") {
+                  const cb = ev.content_block
+                  if (cb?.type === "tool_use") {
+                    toolCallCount++
+                    sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: cb.id, name: stripMcpPrefix(cb.name), input: {} } })
+                  } else if (cb?.type === "text") {
+                    sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })
+                  }
+                  hasEmittedAnyBlock = true
+                } else if (ev.type === "content_block_delta") {
+                  if (ev.delta?.type === "text_delta") {
+                    fullText += ev.delta.text ?? ""
+                    traceStore.updateOutput(reqId, fullText.length)
+                    checkOutputSize(fullText.length)
+                    sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "text_delta", text: ev.delta.text ?? "" } })
+                  } else if (ev.delta?.type === "input_json_delta") {
+                    sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: ev.delta.partial_json ?? "" } })
+                  }
+                } else if (ev.type === "content_block_stop") {
+                  sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
+                  blockIdx++
+                } else if (ev.type === "message_delta") {
+                  if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+                }
+              }
+
               try {
                 traceStore.phase(reqId, "sdk_starting")
-                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
+                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers, canUseTool }) })) {
                   sdkEventCount++
                   lastEventAt = Date.now()
                   resetStallTimer()
                   const subtype = (message as any).event?.type ?? (message as any).message?.type
-                  // Capture session_id from init message
                   if (message.type === "system" && (message as any).subtype === "init") {
                     capturedSessionId = (message as any).session_id
                   }
                   if (message.type === "stream_event") {
-                    const ev = message.event as any
-                    // Detect first content event BEFORE sdkEvent records it
+                    const ev = (message as any).event as any
                     if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
                       traceStore.phase(reqId, "sdk_streaming")
                     }
-                    if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                      fullText += ev.delta.text ?? ""
-                      traceStore.updateOutput(reqId, fullText.length)
-                      checkOutputSize(fullText.length)
-                    }
+                    forwardStreamEvent(ev)
                   }
                   traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                 }
@@ -1143,13 +1160,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     .join("\n\n")
                   const baseSystem = systemContext || ""
                   const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
-                  const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
+                  const fallbackSystem = (baseSystem + contextSection).trim() || undefined
                   const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
                     ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
                     : serializeContent(fbLastMsg.content)
-                  const fallbackOpts = buildQueryOptions(model, { partial: true, systemPrompt: fallbackSystem, abortController, thinking })
+                  const fallbackOpts = buildQueryOptions(model, { partial: true, systemPrompt: fallbackSystem, abortController, thinking, mcpServers, canUseTool })
 
                   logInfo("session.fallback_full_context_stream", { reqId, conversationId })
+                  // Reset state for fallback
+                  fullText = ""
+                  blockIdx = 0
+                  toolCallCount = 0
+                  capturedStopReason = null
+                  hasEmittedAnyBlock = false
                   sdkEventCount = 0
                   for await (const message of query({ prompt: fallbackInput, options: fallbackOpts })) {
                     sdkEventCount++
@@ -1160,15 +1183,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                       capturedSessionId = (message as any).session_id
                     }
                     if (message.type === "stream_event") {
-                      const ev = message.event as any
+                      const ev = (message as any).event as any
                       if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
                         traceStore.phase(reqId, "sdk_streaming")
                       }
-                      if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                        fullText += ev.delta.text ?? ""
-                        traceStore.updateOutput(reqId, fullText.length)
-                        checkOutputSize(fullText.length)
-                      }
+                      forwardStreamEvent(ev)
                     }
                     traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                   }
@@ -1184,52 +1203,29 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 clearInterval(stallLog)
                 clearInterval(heartbeat)
                 clearStallTimer(); clearHardTimer()
-                // (temp files no longer used — images passed natively)
                 releaseQueue()
               }
 
               traceStore.phase(reqId, "responding")
-              const { toolCalls, textBefore } = parseToolUse(fullText)
 
-              // Debug: log when tools were expected but none parsed
-              if (toolCalls.length === 0 && fullText.length > 0) {
-                logDebug("tool_parse.no_match_stream", {
-                  reqId,
-                  outputLen: fullText.length,
-                  textPreview: fullText.slice(0, 500),
-                  hasToolUseTag: fullText.includes("<tool_use>"),
-                  hasFunctionCalls: fullText.includes("<function_calls>"),
-                  hasInvoke: fullText.includes("<invoke"),
-                  hasAntmlInvoke: fullText.includes("antml:invoke"),
-                })
-              }
-
-              let blockIdx = 0
-              const textContent = toolCalls.length === 0 ? (fullText || "...") : textBefore
-              if (textContent) {
-                sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })
-                sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "text_delta", text: textContent } })
-                sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
-                blockIdx++
-              } else if (toolCalls.length === 0) {
+              // If no blocks were emitted at all, emit a placeholder text block
+              if (!hasEmittedAnyBlock) {
                 sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
                 sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
                 sse("content_block_stop", { type: "content_block_stop", index: 0 })
-                blockIdx = 1
-              }
-              for (const tc of toolCalls) {
-                sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} } })
-                sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: JSON.stringify(tc.input) } })
-                sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
-                blockIdx++
               }
 
-              const stopReason = toolCalls.length > 0 ? "tool_use" : "end_turn"
+              // Invalidate session when tool_use present — SDK session has stale history
+              if (toolCallCount > 0 && conversationId) {
+                sessionStore.invalidate(conversationId)
+              }
+
+              const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
               sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: roughTokens(fullText) } })
               sse("message_stop", { type: "message_stop" })
               controller.close()
 
-              traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount: toolCalls.length })
+              traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
               return
             }
 
@@ -1306,7 +1302,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   .join("\n\n")
                 const baseSystem = systemContext || ""
                 const contextSection = contextParts ? `\n\nPrior conversation turns:\n\n${contextParts}\n\n---` : ""
-                const fallbackSystem = (baseSystem + contextSection + toolsSection).trim() || undefined
+                const fallbackSystem = (baseSystem + contextSection).trim() || undefined
                 const fallbackInput: string | AsyncIterable<any> = contentHasImages(fbLastMsg.content)
                   ? createSDKUserMessage(buildNativeContent(fbLastMsg.content))
                   : serializeContent(fbLastMsg.content)

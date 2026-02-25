@@ -3,13 +3,10 @@
  * These test pure logic without any network or SDK calls.
  */
 import { describe, test, expect } from "bun:test"
-
-// We import the server module to test the functions indirectly through the API.
-// For functions that aren't exported, we test them through their effects on API responses.
+import { z } from "zod"
+import { jsonSchemaToZod, createToolMcpServer } from "../src/mcpTools"
 
 // ── Model mapping ────────────────────────────────────────────────────────────
-// Tested via the /v1/messages endpoint's model field in API tests.
-// Here we test the logic patterns directly.
 
 describe("model mapping logic", () => {
   function mapModel(model: string): "sonnet" | "opus" | "haiku" {
@@ -40,61 +37,244 @@ describe("model mapping logic", () => {
   })
 })
 
-// ── Tool use XML parsing ─────────────────────────────────────────────────────
+// ── JSON Schema → Zod conversion ────────────────────────────────────────────
 
-describe("tool use XML parsing", () => {
-  function parseToolUse(text: string) {
-    const regex = /<tool_use>([\s\S]*?)<\/tool_use>/g
-    const calls: { name: string; input: unknown }[] = []
-    let firstIdx = -1
-    let m: RegExpExecArray | null
-    while ((m = regex.exec(text)) !== null) {
-      if (firstIdx < 0) firstIdx = m.index
-      try {
-        const p = JSON.parse(m[1]!.trim())
-        calls.push({ name: String(p.name ?? ""), input: p.input ?? {} })
-      } catch {}
-    }
-    return { toolCalls: calls, textBefore: firstIdx > 0 ? text.slice(0, firstIdx).trim() : "" }
-  }
-
-  test("parses single tool call", () => {
-    const text = `<tool_use>{"name": "get_weather", "input": {"city": "Tokyo"}}</tool_use>`
-    const { toolCalls, textBefore } = parseToolUse(text)
-    expect(toolCalls).toHaveLength(1)
-    expect(toolCalls[0]!.name).toBe("get_weather")
-    expect(toolCalls[0]!.input).toEqual({ city: "Tokyo" })
-    expect(textBefore).toBe("")
+describe("jsonSchemaToZod", () => {
+  test("converts string type", () => {
+    const schema = jsonSchemaToZod({ type: "string" })
+    expect(schema instanceof z.ZodString).toBe(true)
+    expect(schema.parse("hello")).toBe("hello")
   })
 
-  test("parses multiple tool calls", () => {
-    const text = `<tool_use>{"name": "a", "input": {}}</tool_use>\n<tool_use>{"name": "b", "input": {"x": 1}}</tool_use>`
-    const { toolCalls } = parseToolUse(text)
-    expect(toolCalls).toHaveLength(2)
-    expect(toolCalls[0]!.name).toBe("a")
-    expect(toolCalls[1]!.name).toBe("b")
-    expect(toolCalls[1]!.input).toEqual({ x: 1 })
+  test("converts number type", () => {
+    const schema = jsonSchemaToZod({ type: "number" })
+    expect(schema instanceof z.ZodNumber).toBe(true)
+    expect(schema.parse(42)).toBe(42)
   })
 
-  test("extracts text before tool calls", () => {
-    const text = `Let me check that for you.\n<tool_use>{"name": "search", "input": {"q": "test"}}</tool_use>`
-    const { toolCalls, textBefore } = parseToolUse(text)
-    expect(toolCalls).toHaveLength(1)
-    expect(textBefore).toBe("Let me check that for you.")
+  test("converts integer type as number", () => {
+    const schema = jsonSchemaToZod({ type: "integer" })
+    expect(schema instanceof z.ZodNumber).toBe(true)
+    expect(schema.parse(7)).toBe(7)
   })
 
-  test("returns empty for no tool calls", () => {
-    const text = "Just a regular message with no tools."
-    const { toolCalls, textBefore } = parseToolUse(text)
-    expect(toolCalls).toHaveLength(0)
-    expect(textBefore).toBe("")
+  test("converts boolean type", () => {
+    const schema = jsonSchemaToZod({ type: "boolean" })
+    expect(schema instanceof z.ZodBoolean).toBe(true)
+    expect(schema.parse(true)).toBe(true)
   })
 
-  test("skips malformed JSON inside tool_use tags", () => {
-    const text = `<tool_use>not json</tool_use>\n<tool_use>{"name": "valid", "input": {}}</tool_use>`
-    const { toolCalls } = parseToolUse(text)
-    expect(toolCalls).toHaveLength(1)
-    expect(toolCalls[0]!.name).toBe("valid")
+  test("converts null type", () => {
+    const schema = jsonSchemaToZod({ type: "null" })
+    expect(schema.parse(null)).toBe(null)
+  })
+
+  test("converts array type", () => {
+    const schema = jsonSchemaToZod({ type: "array", items: { type: "string" } })
+    expect(schema instanceof z.ZodArray).toBe(true)
+    expect(schema.parse(["a", "b"])).toEqual(["a", "b"])
+  })
+
+  test("converts array with no items to array of any", () => {
+    const schema = jsonSchemaToZod({ type: "array" })
+    expect(schema instanceof z.ZodArray).toBe(true)
+    expect(schema.parse([1, "two", true])).toEqual([1, "two", true])
+  })
+
+  test("converts simple object with required properties", () => {
+    const schema = jsonSchemaToZod({
+      type: "object",
+      properties: {
+        city: { type: "string" },
+        temp: { type: "number" }
+      },
+      required: ["city"]
+    })
+    expect(schema instanceof z.ZodObject).toBe(true)
+    // Required field present
+    expect(schema.parse({ city: "Tokyo", temp: 22 })).toEqual({ city: "Tokyo", temp: 22 })
+    // Optional field missing is ok
+    expect(schema.parse({ city: "Tokyo" })).toEqual({ city: "Tokyo" })
+  })
+
+  test("makes non-required properties optional", () => {
+    const schema = jsonSchemaToZod({
+      type: "object",
+      properties: {
+        name: { type: "string" },
+        age: { type: "number" }
+      },
+      required: ["name"]
+    })
+    // age is optional, should pass without it
+    const result = schema.parse({ name: "Alice" })
+    expect(result.name).toBe("Alice")
+  })
+
+  test("converts string enum", () => {
+    const schema = jsonSchemaToZod({ enum: ["red", "green", "blue"] })
+    expect(schema.parse("red")).toBe("red")
+    expect(() => schema.parse("purple")).toThrow()
+  })
+
+  test("converts nested objects", () => {
+    const schema = jsonSchemaToZod({
+      type: "object",
+      properties: {
+        location: {
+          type: "object",
+          properties: {
+            lat: { type: "number" },
+            lng: { type: "number" }
+          },
+          required: ["lat", "lng"]
+        }
+      },
+      required: ["location"]
+    })
+    expect(schema.parse({ location: { lat: 35.6, lng: 139.7 } }))
+      .toEqual({ location: { lat: 35.6, lng: 139.7 } })
+  })
+
+  test("converts anyOf with null → nullable", () => {
+    const schema = jsonSchemaToZod({
+      anyOf: [{ type: "string" }, { type: "null" }]
+    })
+    expect(schema.parse("hello")).toBe("hello")
+    expect(schema.parse(null)).toBe(null)
+  })
+
+  test("converts oneOf as union", () => {
+    const schema = jsonSchemaToZod({
+      oneOf: [{ type: "string" }, { type: "number" }]
+    })
+    expect(schema.parse("hello")).toBe("hello")
+    expect(schema.parse(42)).toBe(42)
+  })
+
+  test("converts array type notation like [\"string\", \"null\"]", () => {
+    const schema = jsonSchemaToZod({ type: ["string", "null"] })
+    expect(schema.parse("test")).toBe("test")
+    expect(schema.parse(null)).toBe(null)
+  })
+
+  test("handles const values", () => {
+    const schema = jsonSchemaToZod({ const: "fixed_value" })
+    expect(schema.parse("fixed_value")).toBe("fixed_value")
+  })
+
+  test("falls back to z.any() for null/undefined schema", () => {
+    expect(jsonSchemaToZod(null).parse("anything")).toBe("anything")
+    expect(jsonSchemaToZod(undefined).parse(42)).toBe(42)
+  })
+
+  test("falls back to z.any() for unknown type", () => {
+    const schema = jsonSchemaToZod({ type: "unknown_type" })
+    expect(schema.parse("anything")).toBe("anything")
+  })
+
+  test("handles object with no properties (passthrough)", () => {
+    const schema = jsonSchemaToZod({ type: "object" })
+    expect(schema.parse({ any: "value", works: true })).toEqual({ any: "value", works: true })
+  })
+
+  test("handles schema with properties but no type", () => {
+    const schema = jsonSchemaToZod({
+      properties: { name: { type: "string" } },
+      required: ["name"]
+    })
+    expect(schema.parse({ name: "test" })).toEqual({ name: "test" })
+  })
+
+  test("handles mixed literal enum", () => {
+    const schema = jsonSchemaToZod({ enum: [1, 2, 3] })
+    expect(schema.parse(1)).toBe(1)
+  })
+
+  test("converts real-world Anthropic tool schema", () => {
+    const schema = jsonSchemaToZod({
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "The bash command to execute"
+        },
+        timeout: {
+          type: "integer",
+          description: "Timeout in seconds"
+        }
+      },
+      required: ["command"]
+    })
+    expect(schema.parse({ command: "ls -la" })).toEqual({ command: "ls -la" })
+    expect(schema.parse({ command: "pwd", timeout: 30 })).toEqual({ command: "pwd", timeout: 30 })
+  })
+})
+
+// ── createToolMcpServer ─────────────────────────────────────────────────────
+
+describe("createToolMcpServer", () => {
+  test("creates server with single tool", () => {
+    const server = createToolMcpServer([{
+      name: "get_weather",
+      description: "Get weather for a city",
+      input_schema: {
+        type: "object",
+        properties: { city: { type: "string" } },
+        required: ["city"]
+      }
+    }])
+    expect(server.type).toBe("sdk")
+    expect(server.name).toBe("proxy-tools")
+    expect(server.instance).toBeDefined()
+  })
+
+  test("creates server with multiple tools", () => {
+    const server = createToolMcpServer([
+      {
+        name: "search",
+        description: "Search the web",
+        input_schema: {
+          type: "object",
+          properties: { query: { type: "string" } },
+          required: ["query"]
+        }
+      },
+      {
+        name: "calculate",
+        description: "Do math",
+        input_schema: {
+          type: "object",
+          properties: {
+            expression: { type: "string" },
+            precision: { type: "integer" }
+          },
+          required: ["expression"]
+        }
+      }
+    ])
+    expect(server.type).toBe("sdk")
+    expect(server.name).toBe("proxy-tools")
+    expect(server.instance).toBeDefined()
+  })
+
+  test("handles tool with no input_schema", () => {
+    const server = createToolMcpServer([{
+      name: "noop",
+      description: "Does nothing"
+    }])
+    expect(server.type).toBe("sdk")
+    expect(server.instance).toBeDefined()
+  })
+
+  test("handles tool with empty schema", () => {
+    const server = createToolMcpServer([{
+      name: "ping",
+      description: "Ping",
+      input_schema: {}
+    }])
+    expect(server.type).toBe("sdk")
+    expect(server.instance).toBeDefined()
   })
 })
 
