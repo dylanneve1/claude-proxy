@@ -679,6 +679,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       let promptInput: string | AsyncIterable<any>
       // promptText: always the text-only version for token counting and logging
       promptText = serializeContent(lastMsg.content)
+      // Track real usage from SDK stream events (fallback to rough estimate)
+      const roughContextTokens = roughTokens((systemContext || "") + messages.map(m => serializeContent(m.content)).join("\n"))
+      let sdkInputTokens = 0
+      let sdkOutputTokens = 0
 
       if (isResuming && resumeSessionId) {
         systemPrompt = (systemContext || "").trim() || undefined
@@ -813,6 +817,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
               } else if (ev.type === "message_delta") {
                 if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+                if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
+              } else if (ev.type === "message_start" && ev.message?.usage) {
+                if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
               }
             } else if (!hasTools && message.type === "assistant") {
               let turnText = ""
@@ -820,6 +827,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 if (block.type === "text") turnText += block.text
               }
               fullText = turnText
+              // Capture usage from assistant message
+              const msgUsage = (message as any).message?.usage
+              if (msgUsage?.input_tokens) sdkInputTokens = msgUsage.input_tokens
+              if (msgUsage?.output_tokens) sdkOutputTokens = msgUsage.output_tokens
             }
           }
           traceStore.phase(reqId, "sdk_done")
@@ -890,6 +901,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   }
                 } else if (ev.type === "message_delta") {
                   if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+                  if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
+                } else if (ev.type === "message_start" && ev.message?.usage) {
+                  if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
                 }
               } else if (!hasTools && message.type === "assistant") {
                 let turnText = ""
@@ -897,6 +911,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (block.type === "text") turnText += block.text
                 }
                 fullText = turnText
+                const msgUsage = (message as any).message?.usage
+                if (msgUsage?.input_tokens) sdkInputTokens = msgUsage.input_tokens
+                if (msgUsage?.output_tokens) sdkOutputTokens = msgUsage.output_tokens
               }
             }
             traceStore.phase(reqId, "sdk_done")
@@ -937,9 +954,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             id: generateId("msg_"),
             type: "message", role: "assistant", content,
             model: body.model, stop_reason: stopReason, stop_sequence: null,
-            usage: { input_tokens: roughTokens(promptText), output_tokens: roughTokens(fullText) }
+            usage: { input_tokens: sdkInputTokens || roughContextTokens, output_tokens: sdkOutputTokens || roughTokens(fullText) }
           })
         }
+
+        logDebug("usage.tokens", { reqId, sdkInput: sdkInputTokens, sdkOutput: sdkOutputTokens, roughInput: roughContextTokens, roughOutput: roughTokens(fullText) })
 
         if (!fullText || !fullText.trim()) fullText = "..."
         traceStore.complete(reqId, { outputLen: fullText.length })
@@ -949,7 +968,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           type: "message", role: "assistant",
           content: [{ type: "text", text: fullText }],
           model: body.model, stop_reason: "end_turn", stop_sequence: null,
-          usage: { input_tokens: roughTokens(promptText), output_tokens: roughTokens(fullText) }
+          usage: { input_tokens: sdkInputTokens || roughContextTokens, output_tokens: sdkOutputTokens || roughTokens(fullText) }
         })
       }
 
@@ -1015,14 +1034,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
             }, 15_000)
 
-            sse("message_start", {
-              type: "message_start",
-              message: {
-                id: messageId, type: "message", role: "assistant", content: [],
-                model: body.model, stop_reason: null, stop_sequence: null,
-                usage: { input_tokens: roughTokens(promptText), output_tokens: 1 }
+            // Defer message_start until SDK provides real input_tokens
+            let messageStartSent = false
+            const emitMessageStart = () => {
+              if (!messageStartSent) {
+                messageStartSent = true
+                sse("message_start", {
+                  type: "message_start",
+                  message: {
+                    id: messageId, type: "message", role: "assistant", content: [],
+                    model: body.model, stop_reason: null, stop_sequence: null,
+                    usage: { input_tokens: sdkInputTokens || roughContextTokens, output_tokens: 1 }
+                  }
+                })
               }
-            })
+            }
 
             if (hasTools) {
               // ── With tools: forward native SDK stream events directly as SSE ──
@@ -1041,6 +1067,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
               // Helper to forward a stream event directly as SSE
               const forwardStreamEvent = (ev: any) => {
+                if (ev.type === "message_start" && ev.message?.usage) {
+                  if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
+                  emitMessageStart()
+                  return
+                }
+                // Ensure message_start is sent before any content blocks
+                emitMessageStart()
                 if (ev.type === "content_block_start") {
                   const cb = ev.content_block
                   if (cb?.type === "tool_use") {
@@ -1064,6 +1097,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   blockIdx++
                 } else if (ev.type === "message_delta") {
                   if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
+                  if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
                 }
               }
 
@@ -1149,6 +1183,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
               traceStore.phase(reqId, "responding")
 
+              // Ensure message_start is sent even if no SDK events came
+              emitMessageStart()
+
               // If no blocks were emitted at all, emit a placeholder text block
               if (!hasEmittedAnyBlock) {
                 sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
@@ -1157,7 +1194,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
 
               const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
-              sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: roughTokens(fullText) } })
+              sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: sdkOutputTokens || roughTokens(fullText) } })
               sse("message_stop", { type: "message_stop" })
               controller.close()
 
@@ -1166,7 +1203,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
 
             // ── No tools: stream text deltas directly ─────────────────────
-            sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+            let contentBlockStartSent = false
 
             let fullText = ""
             let hasStreamed = false
@@ -1190,6 +1227,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 }
                 if (message.type === "stream_event") {
                   const ev = message.event as any
+                  // Capture usage from SDK message_start (real input tokens)
+                  if (ev.type === "message_start" && ev.message?.usage?.input_tokens) {
+                    sdkInputTokens = ev.message.usage.input_tokens
+                    emitMessageStart()
+                  }
                   // Detect first content event BEFORE sdkEvent records it
                   if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
                     traceStore.phase(reqId, "sdk_streaming")
@@ -1197,12 +1239,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
                     const text = ev.delta.text ?? ""
                     if (text) {
+                      // Ensure message_start and content_block_start are sent before first delta
+                      emitMessageStart()
+                      if (!contentBlockStartSent) {
+                        contentBlockStartSent = true
+                        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+                      }
                       fullText += text
                       hasStreamed = true
                       traceStore.updateOutput(reqId, fullText.length)
                       checkOutputSize(fullText.length)
                       sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
                     }
+                  } else if (ev.type === "message_delta" && ev.usage?.output_tokens) {
+                    sdkOutputTokens = ev.usage.output_tokens
                   }
                 }
                 traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
@@ -1241,18 +1291,29 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   }
                   if (message.type === "stream_event") {
                     const ev = message.event as any
+                    if (ev.type === "message_start" && ev.message?.usage?.input_tokens) {
+                      sdkInputTokens = ev.message.usage.input_tokens
+                      emitMessageStart()
+                    }
                     if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
                       traceStore.phase(reqId, "sdk_streaming")
                     }
                     if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
                       const text = ev.delta.text ?? ""
                       if (text) {
+                        emitMessageStart()
+                        if (!contentBlockStartSent) {
+                          contentBlockStartSent = true
+                          sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+                        }
                         fullText += text
                         hasStreamed = true
                         traceStore.updateOutput(reqId, fullText.length)
                         checkOutputSize(fullText.length)
                         sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
                       }
+                    } else if (ev.type === "message_delta" && ev.usage?.output_tokens) {
+                      sdkOutputTokens = ev.usage.output_tokens
                     }
                   }
                   traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
@@ -1273,12 +1334,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               releaseQueue()
             }
 
+            // Ensure message_start and content_block_start are emitted even if no stream events came
+            emitMessageStart()
+            if (!contentBlockStartSent) {
+              contentBlockStartSent = true
+              sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+            }
+
             if (!hasStreamed) {
               sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             }
 
             sse("content_block_stop", { type: "content_block_stop", index: 0 })
-            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: roughTokens(fullText) } })
+            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: sdkOutputTokens || roughTokens(fullText) } })
             sse("message_stop", { type: "message_stop" })
             controller.close()
 
