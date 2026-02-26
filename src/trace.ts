@@ -25,6 +25,21 @@ export interface TraceError {
   phase: TracePhase  // Which phase the error occurred in
 }
 
+export interface TraceUsage {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
+
+export interface TraceSession {
+  conversationId?: string
+  sdkSessionId?: string
+  isResuming: boolean
+  resumeCount?: number
+  resumeFailed?: boolean
+}
+
 export interface RequestTrace {
   reqId: string
   startedAt: number       // Date.now() when request received
@@ -43,6 +58,12 @@ export interface RequestTrace {
   // Client info
   clientIp?: string
   userAgent?: string
+
+  // Session / resumption info
+  session?: TraceSession
+
+  // SDK usage (authoritative, from result message)
+  usage?: TraceUsage
 
   // Timing milestones (all Date.now() values)
   queuedAt?: number       // When we started waiting for a slot
@@ -236,6 +257,18 @@ class TraceStore {
         outputLen: trace.outputLen,
       })
     }
+
+    // Log important lifecycle events at info level
+    if (eventType === "result" || subtype === "message_start" || subtype === "message_delta") {
+      logInfo("trace.sdk_lifecycle", {
+        reqId,
+        n: eventNum,
+        type: eventType,
+        subtype,
+        elapsedMs: now - trace.startedAt,
+        model: trace.model,
+      })
+    }
   }
 
   /** Record a stall check (called every 15s). Only warns if idle > 30s. */
@@ -307,6 +340,8 @@ class TraceStore {
       charsPerSec,
       eventsPerSec,
       eventTypes: trace.eventTypes,
+      ...(trace.usage ? { usage: trace.usage } : {}),
+      ...(trace.session ? { session: trace.session } : {}),
     })
 
     // Update stats
@@ -380,6 +415,8 @@ class TraceStore {
       timeSinceLastEventMs: timeSinceLastEvent,
       lastEventType: trace.lastEventType,
       eventTypes: trace.eventTypes,
+      ...(trace.usage ? { usage: trace.usage } : {}),
+      ...(trace.session ? { session: trace.session } : {}),
       ...extra,
     })
 
@@ -424,6 +461,18 @@ class TraceStore {
   updateOutput(reqId: string, outputLen: number) {
     const trace = this.activeTraces.get(reqId)
     if (trace) trace.outputLen = outputLen
+  }
+
+  /** Set session/resumption info on a trace. */
+  setSession(reqId: string, session: TraceSession) {
+    const trace = this.activeTraces.get(reqId)
+    if (trace) trace.session = session
+  }
+
+  /** Set final SDK usage on a trace. */
+  setUsage(reqId: string, usage: TraceUsage) {
+    const trace = this.activeTraces.get(reqId)
+    if (trace) trace.usage = usage
   }
 
   /** Set the SDK debug log path for a trace. */
@@ -596,6 +645,8 @@ class TraceStore {
         ? { completedAt: new Date(trace.completedAt).toISOString() }
         : { elapsedMs: now - trace.startedAt, timeSinceLastEventMs: timeSinceLastEvent }),
       ...timings,
+      ...(trace.usage ? { usage: trace.usage } : {}),
+      ...(trace.session ? { session: trace.session } : {}),
       ...(trace.error ? { error: trace.error } : {}),
       ...(trace.sdkDebugLogPath ? { sdkDebugLogPath: trace.sdkDebugLogPath } : {}),
     }

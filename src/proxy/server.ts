@@ -759,6 +759,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         userAgent,
       })
 
+      // Attach session info to trace
+      if (conversationId) {
+        traceStore.setSession(reqId, {
+          conversationId,
+          sdkSessionId: resumeSessionId,
+          isResuming,
+          resumeCount: isResuming ? sessionStore.get(conversationId)?.resumeCount : undefined,
+        })
+      }
+
       // ── Queue ─────────────────────────────────────────────────────────────
       const queueActive = requestQueue.activeCount
       const queueWaiting = requestQueue.waitingCount
@@ -1002,6 +1012,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
           const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
 
+          traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
           traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
 
           return c.json({
@@ -1015,6 +1026,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         logDebug("usage.tokens", { reqId, sdkInput: sdkInputTokens, sdkOutput: sdkOutputTokens, cacheRead: sdkCacheReadTokens, cacheCreation: sdkCacheCreationTokens })
 
         if (!fullText || !fullText.trim()) fullText = "..."
+        traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
         traceStore.complete(reqId, { outputLen: fullText.length })
 
         return c.json({
@@ -1274,6 +1286,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               sse("message_stop", { type: "message_stop" })
               controller.close()
 
+              traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
               traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
               return
             }
@@ -1450,6 +1463,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             sse("message_stop", { type: "message_stop" })
             controller.close()
 
+            traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
             traceStore.complete(reqId, { outputLen: fullText.length })
 
           } catch (error) {
