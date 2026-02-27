@@ -8,13 +8,24 @@ import { logInfo, logWarn, logError, logDebug, LOG_DIR, dumpSessionContext } fro
 import { traceStore } from "../trace"
 import { sessionStore } from "../session-store"
 import { createToolMcpServer } from "../mcpTools"
+import { classifyError } from "../errors"
+import {
+  mapModelToClaudeModel, serializeContent, contentHasImages,
+  buildNativeContent, createSDKUserMessage, stripMcpPrefix,
+  roughTokens, buildUsage, extractConversationLabel,
+} from "../content"
+import {
+  openaiToAnthropicMessages, openaiToAnthropicTools,
+  anthropicToOpenaiResponse,
+} from "../openai-compat"
 import { execSync } from "child_process"
-import { existsSync, writeFileSync, readFileSync, readdirSync } from "fs"
+import { existsSync, readFileSync, readdirSync } from "fs"
 import { randomBytes } from "crypto"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 
-// Base62 ID generator — matches Anthropic's real ID format (e.g. msg_01XFDUDYJgAACzvnptvVoYEL)
+// ── ID generation & version ──────────────────────────────────────────────────
+
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 function generateId(prefix: string, length = 24): string {
   const bytes = randomBytes(length)
@@ -46,10 +57,8 @@ function resolveClaudeExecutable(): string {
 const claudeExecutable = resolveClaudeExecutable()
 
 // ── Concurrency control ──────────────────────────────────────────────────────
-// Limits simultaneous Claude SDK sessions to prevent resource exhaustion.
 
 const MAX_CONCURRENT = parseInt(process.env.CLAUDE_PROXY_MAX_CONCURRENT ?? "5", 10)
-
 const QUEUE_TIMEOUT_MS = parseInt(process.env.CLAUDE_PROXY_QUEUE_TIMEOUT_MS ?? "30000", 10)
 
 class RequestQueue {
@@ -88,7 +97,8 @@ class RequestQueue {
 
 const requestQueue = new RequestQueue()
 
-// ── Last-context cache (per conversation) for before/after dumps on reset/compaction ──
+// ── Last-context cache ───────────────────────────────────────────────────────
+
 interface LastContext {
   systemPrompt: string
   messages: Array<{ role: string; content: string | Array<any> }>
@@ -97,174 +107,6 @@ interface LastContext {
 }
 const lastContextCache = new Map<string, LastContext>()
 const MAX_CONTEXT_CACHE = 100
-
-function mapModelToClaudeModel(model: string): "sonnet" | "opus" | "haiku" {
-  if (model.includes("opus")) return "opus"
-  if (model.includes("haiku")) return "haiku"
-  return "sonnet"
-}
-
-// ── Content-block serialization ──────────────────────────────────────────────
-
-function serializeBlock(block: any): string {
-  switch (block.type) {
-    case "text":
-      return block.text || ""
-    case "image":
-      return "[Image attached]"
-    case "tool_use":
-      return `<tool_use>\n{"name": "${block.name}", "input": ${JSON.stringify(block.input ?? {})}}\n</tool_use>`
-    case "tool_result": {
-      const content = Array.isArray(block.content)
-        ? block.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
-        : String(block.content ?? "")
-      const truncated = content.length > 4000
-        ? content.slice(0, 4000) + `\n...[truncated ${content.length - 4000} chars]`
-        : content
-      return `[Tool Result (id: ${block.tool_use_id})]\n${truncated}\n[/Tool Result]`
-    }
-    case "thinking":
-      return ""
-    default:
-      return ""
-  }
-}
-
-function serializeContent(content: string | Array<any>): string {
-  if (typeof content === "string") return content
-  if (!Array.isArray(content)) return String(content)
-  return content.map(b => serializeBlock(b)).filter(Boolean).join("\n")
-}
-
-// ── Image handling via SDKUserMessage ────────────────────────────────────────
-// The SDK query() accepts AsyncIterable<SDKUserMessage> which supports native
-// Anthropic MessageParam content blocks including images. When images are
-// detected, we pass them through natively instead of serializing to text.
-
-function contentHasImages(content: string | Array<any>): boolean {
-  if (typeof content === "string") return false
-  if (!Array.isArray(content)) return false
-  return content.some((b: any) => b.type === "image")
-}
-
-/** Convert an Anthropic image content block to SDK-compatible format */
-function toAnthropicImageBlock(block: any): any {
-  if (block.source) return block // already in Anthropic format
-  // openclaw may use { type: "image", data: "...", mimeType: "..." }
-  if (block.data && block.mimeType) {
-    return {
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: block.mimeType,
-        data: block.data,
-      }
-    }
-  }
-  if (block.data && block.media_type) {
-    return {
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: block.media_type,
-        data: block.data,
-      }
-    }
-  }
-  return block
-}
-
-/** Build Anthropic MessageParam content array, preserving images natively */
-function buildNativeContent(content: string | Array<any>): Array<any> {
-  if (typeof content === "string") return [{ type: "text", text: content }]
-  if (!Array.isArray(content)) return [{ type: "text", text: String(content) }]
-  return content.map((block: any) => {
-    if (block.type === "image") return toAnthropicImageBlock(block)
-    if (block.type === "text") return { type: "text", text: block.text ?? "" }
-    // For other types, serialize to text
-    const serialized = serializeBlock(block)
-    return serialized ? { type: "text", text: serialized } : null
-  }).filter(Boolean)
-}
-
-/** Create an async iterable yielding a single SDKUserMessage with native content */
-function createSDKUserMessage(content: Array<any>, sessionId?: string): AsyncIterable<any> {
-  const msg = {
-    type: "user" as const,
-    message: {
-      role: "user" as const,
-      content,
-    },
-    parent_tool_use_id: null,
-    session_id: sessionId ?? "",
-  }
-  return {
-    async *[Symbol.asyncIterator]() {
-      yield msg
-    }
-  }
-}
-
-
-// ── Client tool-use support (native MCP) ────────────────────────────────────
-// Tool definitions from the client are converted to native MCP tools via
-// createToolMcpServer(). The SDK generates proper tool_use content blocks
-// instead of text-based XML. We abort the SDK at message_delta (after all
-// content blocks are complete) to prevent internal MCP tool execution.
-
-// The SDK prefixes MCP tool names with "mcp__{server-name}__".
-// Strip this prefix so clients see the original tool names they sent.
-const MCP_TOOL_PREFIX = "mcp__proxy-tools__"
-function stripMcpPrefix(name: string): string {
-  return name.startsWith(MCP_TOOL_PREFIX) ? name.slice(MCP_TOOL_PREFIX.length) : name
-}
-
-function roughTokens(text: string): number {
-  return Math.ceil((text ?? "").length / 4)
-}
-
-function buildUsage(input: number, output: number, cacheRead: number, cacheCreation: number) {
-  const usage: Record<string, number> = { input_tokens: input, output_tokens: output }
-  if (cacheRead > 0) usage.cache_read_input_tokens = cacheRead
-  if (cacheCreation > 0) usage.cache_creation_input_tokens = cacheCreation
-  return usage
-}
-
-// ── Conversation label extraction ────────────────────────────────────────────
-// Openclaw embeds "Conversation info (untrusted metadata)" in the last user
-// message containing a JSON block with conversation_label. Extract it to use
-// as a stable conversation ID for session persistence.
-
-function extractConversationLabel(messages: Array<{ role: string; content: string | Array<any> }>): string | null {
-  // Search from the last message backwards for a user message with metadata
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]!
-    if (msg.role !== "user") continue
-
-    const text = typeof msg.content === "string"
-      ? msg.content
-      : Array.isArray(msg.content)
-        ? msg.content.filter((b: any) => b.type === "text").map((b: any) => b.text ?? "").join("\n")
-        : ""
-
-    // Look for the JSON block after "Conversation info"
-    const jsonMatch = text.match(/Conversation info[^`]*```json\s*(\{[\s\S]*?\})\s*```/)
-    if (!jsonMatch?.[1]) continue
-
-    try {
-      const meta = JSON.parse(jsonMatch[1])
-      // conversation_label is present for both PMs and groups
-      if (meta.conversation_label) return meta.conversation_label
-      // Fallback: use sender_id if no label (shouldn't happen but just in case)
-      if (meta.sender_id) return `dm:${meta.sender_id}`
-    } catch {
-      // Regex fallback if JSON parse fails
-      const labelMatch = text.match(/"conversation_label"\s*:\s*"([^"]*)"/)
-      if (labelMatch?.[1]) return labelMatch[1]
-    }
-  }
-  return null
-}
 
 // ── Query options builder ────────────────────────────────────────────────────
 
@@ -295,6 +137,187 @@ function buildQueryOptions(
     ...(opts.resume ? { resume: opts.resume } : {}),
     ...(opts.mcpServers ? { mcpServers: opts.mcpServers } : {}),
   }
+}
+
+// ── Shared SDK helpers ───────────────────────────────────────────────────────
+// These reduce duplication across the 6 SDK event loops (main/fallback × non-streaming/streaming-tools/streaming-notools).
+
+interface SdkUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+}
+
+function newUsage(): SdkUsage {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 }
+}
+
+function makeUsageObj(u: SdkUsage) {
+  return {
+    input_tokens: u.inputTokens,
+    output_tokens: u.outputTokens,
+    ...(u.cacheReadTokens > 0 ? { cache_read_input_tokens: u.cacheReadTokens } : {}),
+    ...(u.cacheCreationTokens > 0 ? { cache_creation_input_tokens: u.cacheCreationTokens } : {}),
+  }
+}
+
+/** Capture session_id and usage from common SDK message types. Returns session_id if found. */
+function processSdkMessage(message: any, usage: SdkUsage): string | undefined {
+  let sessionId: string | undefined
+  if (message.type === "system" && (message as any).subtype === "init") {
+    sessionId = (message as any).session_id
+  }
+  if (message.type === "result") {
+    const r = message as any
+    if (r.session_id) sessionId = r.session_id
+    if (r.usage) {
+      usage.inputTokens = r.usage.input_tokens ?? usage.inputTokens
+      usage.outputTokens = r.usage.output_tokens ?? usage.outputTokens
+      usage.cacheReadTokens = r.usage.cache_read_input_tokens ?? usage.cacheReadTokens
+      usage.cacheCreationTokens = r.usage.cache_creation_input_tokens ?? usage.cacheCreationTokens
+    }
+  }
+  return sessionId
+}
+
+/** Capture usage from stream_event message_start. */
+function captureMessageStartUsage(ev: any, usage: SdkUsage): void {
+  if (ev.type === "message_start" && ev.message?.usage) {
+    if (ev.message.usage.input_tokens) usage.inputTokens = ev.message.usage.input_tokens
+    if (ev.message.usage.cache_read_input_tokens) usage.cacheReadTokens = ev.message.usage.cache_read_input_tokens
+    if (ev.message.usage.cache_creation_input_tokens) usage.cacheCreationTokens = ev.message.usage.cache_creation_input_tokens
+  }
+}
+
+interface NonStreamToolState {
+  contentBlocks: any[]
+  currentToolBlock: { id: string; name: string; jsonAccum: string } | null
+  fullText: string
+  capturedStopReason: string | null
+}
+
+function newNonStreamToolState(): NonStreamToolState {
+  return { contentBlocks: [], currentToolBlock: null, fullText: "", capturedStopReason: null }
+}
+
+/** Process a stream_event for non-streaming tool accumulation. */
+function processNonStreamToolEvent(ev: any, state: NonStreamToolState, usage: SdkUsage): void {
+  if (ev.type === "content_block_start") {
+    const cb = ev.content_block
+    if (cb?.type === "tool_use") {
+      state.currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
+    } else if (cb?.type === "text") {
+      state.contentBlocks.push({ type: "text", text: "" })
+    }
+  } else if (ev.type === "content_block_delta") {
+    if (ev.delta?.type === "text_delta") {
+      const lastText = state.contentBlocks[state.contentBlocks.length - 1]
+      if (lastText?.type === "text") {
+        lastText.text += ev.delta.text ?? ""
+      } else {
+        state.contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
+      }
+      state.fullText += ev.delta.text ?? ""
+    } else if (ev.delta?.type === "input_json_delta" && state.currentToolBlock) {
+      state.currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
+    }
+  } else if (ev.type === "content_block_stop") {
+    if (state.currentToolBlock) {
+      let input: any = {}
+      try { input = JSON.parse(state.currentToolBlock.jsonAccum) } catch {}
+      state.contentBlocks.push({
+        type: "tool_use",
+        id: state.currentToolBlock.id,
+        name: state.currentToolBlock.name,
+        input,
+      })
+      state.currentToolBlock = null
+    }
+  } else if (ev.type === "message_delta") {
+    if (ev.delta?.stop_reason) state.capturedStopReason = ev.delta.stop_reason
+    if (ev.usage?.output_tokens) usage.outputTokens = ev.usage.output_tokens
+  } else {
+    captureMessageStartUsage(ev, usage)
+  }
+}
+
+function hasToolBlocks(state: NonStreamToolState): boolean {
+  return state.contentBlocks.some((b: any) => b.type === "tool_use")
+}
+
+/** Save session mapping after successful SDK query. */
+function saveSession(
+  conversationId: string | null,
+  capturedSessionId: string | undefined,
+  isResuming: boolean,
+  isCompacted: boolean,
+  msgCount: number,
+  model: string,
+  reqId: string,
+  logEvent?: string,
+): void {
+  if (!conversationId || !capturedSessionId) return
+  if (isResuming) {
+    sessionStore.recordResume(conversationId, msgCount, isCompacted)
+  } else {
+    sessionStore.set(conversationId, capturedSessionId, model, msgCount)
+  }
+  if (logEvent) logInfo(logEvent, { reqId, conversationId, sdkSessionId: capturedSessionId })
+}
+
+/** Run the non-streaming SDK event loop. Handles tool events, usage, session capture, and tool abort. */
+async function runNonStreamSdkLoop(
+  promptInput: string | AsyncIterable<any>,
+  queryOpts: any,
+  hasTools: boolean,
+  abortController: AbortController,
+  reqId: string,
+  usage: SdkUsage,
+  resetStallTimer: () => void,
+): Promise<{ sessionId?: string; toolState: NonStreamToolState; fullText: string; sdkEventCount: number; aborted: boolean }> {
+  const toolState = newNonStreamToolState()
+  let fullText = ""
+  let sessionId: string | undefined
+  let sdkEventCount = 0
+
+  try {
+    for await (const message of query({ prompt: promptInput, options: queryOpts })) {
+      sdkEventCount++
+      resetStallTimer()
+      traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
+      const sid = processSdkMessage(message, usage)
+      if (sid) sessionId = sid
+
+      if (hasTools && message.type === "stream_event") {
+        const ev = (message as any).event as any
+        processNonStreamToolEvent(ev, toolState, usage)
+        // Abort after all content blocks are complete (message_delta comes after all content_block_stop per API spec)
+        if (toolState.capturedStopReason && hasToolBlocks(toolState) && !abortController.signal.aborted) {
+          logInfo("sdk.abort_after_complete_response", { reqId, contentBlockCount: toolState.contentBlocks.length, stopReason: toolState.capturedStopReason })
+          abortController.abort()
+        }
+      } else if (!hasTools && message.type === "assistant") {
+        let turnText = ""
+        for (const block of (message as any).message.content) {
+          if (block.type === "text") turnText += block.text
+        }
+        fullText = turnText
+        const msgUsage = (message as any).message?.usage
+        if (msgUsage?.input_tokens) usage.inputTokens = msgUsage.input_tokens
+        if (msgUsage?.output_tokens) usage.outputTokens = msgUsage.output_tokens
+      }
+    }
+  } catch (err) {
+    // Abort after message_delta with tool blocks is expected — return accumulated results
+    if (abortController.signal.aborted && hasToolBlocks(toolState)) {
+      logInfo("sdk.aborted_after_tool_call_nonstream", { reqId, sdkEventCount, contentBlocks: toolState.contentBlocks.length })
+      return { sessionId, toolState, fullText: hasTools ? toolState.fullText : fullText, sdkEventCount, aborted: true }
+    }
+    throw err
+  }
+
+  return { sessionId, toolState, fullText: hasTools ? toolState.fullText : fullText, sdkEventCount, aborted: false }
 }
 
 // ── Route handler ────────────────────────────────────────────────────────────
@@ -334,7 +357,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     if (betaHeader) c.header("anthropic-beta", betaHeader)
     await next()
     const ms = Date.now() - start
-    // Only log non-debug HTTP requests at info level; debug endpoints at debug level
     if (c.req.path.startsWith("/debug")) {
       logDebug("http.request", { method: c.req.method, path: c.req.path, status: c.res.status, ms, reqId: requestId })
     } else {
@@ -377,19 +399,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     })
   })
 
-  // ── Session management endpoints ──────────────────────────────────────
-
-  app.get("/sessions", (c) => {
-    return c.json({
-      sessions: sessionStore.list(),
-      stats: sessionStore.getStats(),
-    })
-  })
-
-  app.get("/sessions/cleanup", (c) => {
-    const result = sessionStore.cleanup()
-    return c.json(result)
-  })
+  app.get("/sessions", (c) => c.json({ sessions: sessionStore.list(), stats: sessionStore.getStats() }))
+  app.get("/sessions/cleanup", (c) => c.json(sessionStore.cleanup()))
 
   app.delete("/sessions/:id", (c) => {
     const id = decodeURIComponent(c.req.param("id"))
@@ -402,102 +413,59 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
     return c.json({ ok: false, error: "session not found" }, 404)
   })
 
-  app.get("/debug/traces", (c) => {
-    const limit = parseInt(c.req.query("limit") ?? "20", 10)
-    return c.json(traceStore.getRecentTraces(limit))
-  })
-
+  app.get("/debug/traces", (c) => c.json(traceStore.getRecentTraces(parseInt(c.req.query("limit") ?? "20", 10))))
   app.get("/debug/traces/:id", (c) => {
-    const id = c.req.param("id")
-    const trace = traceStore.getTrace(id)
-    if (!trace) return c.json({ error: "Trace not found", reqId: id }, 404)
-    return c.json(trace)
+    const trace = traceStore.getTrace(c.req.param("id"))
+    return trace ? c.json(trace) : c.json({ error: "Trace not found", reqId: c.req.param("id") }, 404)
   })
-
-  app.get("/debug/errors", (c) => {
-    const limit = parseInt(c.req.query("limit") ?? "10", 10)
-    return c.json(traceStore.getRecentErrors(limit))
-  })
+  app.get("/debug/errors", (c) => c.json(traceStore.getRecentErrors(parseInt(c.req.query("limit") ?? "10", 10))))
 
   app.get("/debug/logs", (c) => {
-    // List available log files
     try {
-      const files = readdirSync(LOG_DIR)
-        .filter(f => f.startsWith("proxy-") && f.endsWith(".log"))
-        .sort()
-        .reverse()
+      const files = readdirSync(LOG_DIR).filter(f => f.startsWith("proxy-") && f.endsWith(".log")).sort().reverse()
       return c.json({ logDir: LOG_DIR, files })
-    } catch {
-      return c.json({ logDir: LOG_DIR, files: [], error: "Cannot read log directory" })
-    }
+    } catch { return c.json({ logDir: LOG_DIR, files: [], error: "Cannot read log directory" }) }
   })
 
   app.get("/debug/logs/:filename", (c) => {
-    // Serve a specific log file (last N lines)
     const filename = c.req.param("filename")
-    if (!filename.match(/^proxy-\d{4}-\d{2}-\d{2}\.log$/)) {
-      return c.json({ error: "Invalid log filename" }, 400)
-    }
+    if (!filename.match(/^proxy-\d{4}-\d{2}-\d{2}\.log$/)) return c.json({ error: "Invalid log filename" }, 400)
     const tail = parseInt(c.req.query("tail") ?? "100", 10)
     try {
       const content = readFileSync(join(LOG_DIR, filename), "utf-8")
       const lines = content.trim().split("\n")
       const sliced = lines.slice(-tail)
-      const parsed = sliced.map(line => {
-        try { return JSON.parse(line) } catch { return { raw: line } }
-      })
+      const parsed = sliced.map(line => { try { return JSON.parse(line) } catch { return { raw: line } } })
       return c.json({ file: filename, total: lines.length, returned: sliced.length, lines: parsed })
-    } catch {
-      return c.json({ error: "Log file not found" }, 404)
-    }
+    } catch { return c.json({ error: "Log file not found" }, 404) }
   })
 
   app.get("/debug/errors/:id", (c) => {
-    // Serve a specific error dump file
     const id = c.req.param("id")
     if (!id.match(/^req_/)) return c.json({ error: "Invalid request ID format" }, 400)
     try {
-      const content = readFileSync(join(LOG_DIR, "errors", `${id}.json`), "utf-8")
-      return c.json(JSON.parse(content))
-    } catch {
-      return c.json({ error: "Error dump not found", reqId: id }, 404)
-    }
+      return c.json(JSON.parse(readFileSync(join(LOG_DIR, "errors", `${id}.json`), "utf-8")))
+    } catch { return c.json({ error: "Error dump not found", reqId: id }, 404) }
   })
 
   app.get("/debug/active", (c) => {
-    // Detailed view of currently active requests
     const stats = traceStore.getStats()
-    return c.json({
-      queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
-      activeRequests: stats.activeRequests,
-    })
+    return c.json({ queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT }, activeRequests: stats.activeRequests })
   })
 
   app.get("/debug/health", (c) => {
-    // Process health: memory, uptime, resource usage
     const mem = process.memoryUsage()
     const stats = traceStore.getStats()
     return c.json({
-      version: PROXY_VERSION,
-      pid: process.pid,
-      uptimeMs: stats.uptimeMs,
-      uptimeHuman: stats.uptimeHuman,
+      version: PROXY_VERSION, pid: process.pid, uptimeMs: stats.uptimeMs, uptimeHuman: stats.uptimeHuman,
       memory: {
-        rss: `${(mem.rss / 1024 / 1024).toFixed(1)}MB`,
-        heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`,
-        heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)}MB`,
-        external: `${(mem.external / 1024 / 1024).toFixed(1)}MB`,
-        rssBytes: mem.rss,
-        heapUsedBytes: mem.heapUsed,
+        rss: `${(mem.rss / 1024 / 1024).toFixed(1)}MB`, heapUsed: `${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB`,
+        heapTotal: `${(mem.heapTotal / 1024 / 1024).toFixed(1)}MB`, external: `${(mem.external / 1024 / 1024).toFixed(1)}MB`,
+        rssBytes: mem.rss, heapUsedBytes: mem.heapUsed,
       },
       queue: { active: requestQueue.activeCount, waiting: requestQueue.waitingCount, max: MAX_CONCURRENT },
       requests: stats.requests,
-      config: {
-        stallTimeoutMs: finalConfig.stallTimeoutMs,
-        maxConcurrent: MAX_CONCURRENT,
-        queueTimeoutMs: QUEUE_TIMEOUT_MS,
-        debug: finalConfig.debug,
-      },
+      config: { stallTimeoutMs: finalConfig.stallTimeoutMs, maxConcurrent: MAX_CONCURRENT, queueTimeoutMs: QUEUE_TIMEOUT_MS, debug: finalConfig.debug },
     })
   })
 
@@ -514,8 +482,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   ]
 
   const MODELS_DUAL = MODELS.map(m => ({
-    ...m,
-    object: "model" as const,
+    ...m, object: "model" as const,
     created: Math.floor(new Date(m.created_at).getTime() / 1000),
     owned_by: "anthropic" as const
   }))
@@ -539,13 +506,9 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const sysText = Array.isArray(body.system)
         ? body.system.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n")
         : String(body.system ?? "")
-      const msgText = (body.messages ?? [])
-        .map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content))
-        .join("\n")
+      const msgText = (body.messages ?? []).map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n")
       return c.json({ input_tokens: roughTokens(sysText + msgText) })
-    } catch {
-      return c.json({ input_tokens: 0 })
-    }
+    } catch { return c.json({ input_tokens: 0 }) }
   }
   app.post("/v1/messages/count_tokens", handleCountTokens)
   app.post("/messages/count_tokens", handleCountTokens)
@@ -554,7 +517,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
   const handleMessages = async (c: Context) => {
     const reqId = generateId("req_")
-    // Will be set after body parse; needed for outer catch
     let trace: ReturnType<typeof traceStore.create> | undefined
     let requestStarted = Date.now()
     let clientDisconnected = false
@@ -564,7 +526,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       let body: any
       try {
         body = await c.req.json()
-      } catch (parseErr) {
+      } catch {
         logWarn("request.invalid_json", { reqId })
         return c.json({ type: "error", error: { type: "invalid_request_error", message: "Request body must be valid JSON" }, request_id: reqId }, 400)
       }
@@ -579,63 +541,32 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const hasTools = body.tools?.length > 0
       const abortController = new AbortController()
 
-      // Stall-based timeout: only aborts if no SDK events received for stallTimeoutMs.
-      // Resets on every SDK event, so active requests never get killed.
-      // NOTE: not started until queue is acquired — queue wait doesn't count.
+      // ── Timers ───────────────────────────────────────────────────────────
       let stallTimer: ReturnType<typeof setTimeout> | null = null
       const resetStallTimer = () => {
         if (stallTimer) clearTimeout(stallTimer)
         stallTimer = setTimeout(() => {
           abortReason = "stall"
-          logWarn("request.stall_timeout", {
-            reqId,
-            stallTimeoutMs: finalConfig.stallTimeoutMs,
-            phase: trace?.phase,
-            sdkEventCount: trace?.sdkEventCount,
-            outputLen: trace?.outputLen,
-            lastEventType: trace?.lastEventType,
-          })
+          logWarn("request.stall_timeout", { reqId, stallTimeoutMs: finalConfig.stallTimeoutMs, phase: trace?.phase, sdkEventCount: trace?.sdkEventCount, outputLen: trace?.outputLen, lastEventType: trace?.lastEventType })
           abortController.abort()
         }, finalConfig.stallTimeoutMs)
       }
-      const clearStallTimer = () => {
-        if (stallTimer) { clearTimeout(stallTimer); stallTimer = null }
-      }
+      const clearStallTimer = () => { if (stallTimer) { clearTimeout(stallTimer); stallTimer = null } }
 
-      // Hard max duration: kills request even if actively streaming. Safety valve.
       let hardTimer: ReturnType<typeof setTimeout> | null = null
       const startHardTimer = () => {
         hardTimer = setTimeout(() => {
           abortReason = "max_duration"
-          logError("request.max_duration", {
-            reqId,
-            maxDurationMs: finalConfig.maxDurationMs,
-            phase: trace?.phase,
-            sdkEventCount: trace?.sdkEventCount,
-            outputLen: trace?.outputLen,
-            model: trace?.model,
-            lastEventType: trace?.lastEventType,
-          })
+          logError("request.max_duration", { reqId, maxDurationMs: finalConfig.maxDurationMs, phase: trace?.phase, sdkEventCount: trace?.sdkEventCount, outputLen: trace?.outputLen, model: trace?.model, lastEventType: trace?.lastEventType })
           abortController.abort()
         }, finalConfig.maxDurationMs)
       }
-      const clearHardTimer = () => {
-        if (hardTimer) { clearTimeout(hardTimer); hardTimer = null }
-      }
+      const clearHardTimer = () => { if (hardTimer) { clearTimeout(hardTimer); hardTimer = null } }
 
-      // Output size check: kills request if output exceeds maxOutputChars.
       const checkOutputSize = (outputLen: number) => {
         if (outputLen > finalConfig.maxOutputChars && !abortReason) {
           abortReason = "max_output"
-          logError("request.max_output", {
-            reqId,
-            outputLen,
-            maxOutputChars: finalConfig.maxOutputChars,
-            phase: trace?.phase,
-            sdkEventCount: trace?.sdkEventCount,
-            model: trace?.model,
-            elapsedMs: trace ? Date.now() - trace.startedAt : undefined,
-          })
+          logError("request.max_output", { reqId, outputLen, maxOutputChars: finalConfig.maxOutputChars, phase: trace?.phase, sdkEventCount: trace?.sdkEventCount, model: trace?.model, elapsedMs: trace ? Date.now() - trace.startedAt : undefined })
           abortController.abort()
         }
       }
@@ -648,33 +579,15 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       let systemContext = ""
       if (body.system) {
-        if (typeof body.system === "string") {
-          systemContext = body.system
-        } else if (Array.isArray(body.system)) {
-          systemContext = body.system
-            .filter((b: any) => b.type === "text" && b.text)
-            .map((b: any) => b.text)
-            .join("\n")
-        }
+        if (typeof body.system === "string") systemContext = body.system
+        else if (Array.isArray(body.system)) systemContext = body.system.filter((b: any) => b.type === "text" && b.text).map((b: any) => b.text).join("\n")
       }
 
       const messages = body.messages as Array<{ role: string; content: string | Array<any> }>
-
-      let promptText: string  // text version for token counting / logging
-      let systemPrompt: string | undefined
-
-      // Create MCP server for native tool calling (if client sent tools)
       const mcpServer = hasTools ? createToolMcpServer(body.tools) : null
       const mcpServers = mcpServer ? { "proxy-tools": mcpServer } : undefined
-      // Tool abort strategy: We use bypassPermissions so canUseTool is never called.
-      // Instead, we abort the SDK when we see message_delta with stop_reason AND
-      // tool blocks have been emitted. At that point, ALL content blocks are complete
-      // (Anthropic API guarantees message_delta comes after all content_block_stop).
-      // This prevents the SDK from doing internal MCP tool execution + second turn.
 
       // ── Session resumption ─────────────────────────────────────────────
-      // Derive conversation ID from: headers (explicit) or conversation_label
-      // embedded in openclaw message metadata.
       const conversationId = c.req.header("x-conversation-id")
         ?? c.req.header("x-session-id")
         ?? extractConversationLabel(messages)
@@ -699,502 +612,136 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         const stored = sessionStore.get(conversationId)
         if (stored) {
           const countDelta = messages.length - stored.messageCount
-
           if (countDelta < 0) {
-            // Message count dropped — either compaction or reset.
-            // In both cases, invalidate the SDK session so the fresh
-            // (compacted) context actually reduces token usage.
-            // The SDK session caches all old turns; resuming it would
-            // defeat compaction entirely.
             const event = messages.length <= 2 ? "reset" : "compaction"
             if (event === "reset") {
-              logInfo("session.likely_reset", {
-                reqId, conversationId, model,
-                sdkSessionId: stored.sdkSessionId,
-                storedMsgCount: stored.messageCount,
-                currentMsgCount: messages.length,
-              })
+              logInfo("session.likely_reset", { reqId, conversationId, model, sdkSessionId: stored.sdkSessionId, storedMsgCount: stored.messageCount, currentMsgCount: messages.length })
             } else {
               isCompacted = true
-              logInfo("session.compaction_detected", {
-                reqId, conversationId, model,
-                sdkSessionId: stored.sdkSessionId,
-                storedMsgCount: stored.messageCount,
-                currentMsgCount: messages.length,
-                dropped: -countDelta,
-              })
+              logInfo("session.compaction_detected", { reqId, conversationId, model, sdkSessionId: stored.sdkSessionId, storedMsgCount: stored.messageCount, currentMsgCount: messages.length, dropped: -countDelta })
             }
-            // Dump full session context (before + after) for debugging
             const prevContext = lastContextCache.get(conversationId)
             const dumpPath = dumpSessionContext(reqId, {
-              event: `session.${event}`,
-              conversationId,
-              model,
-              sdkSessionId: stored.sdkSessionId,
-              storedMsgCount: stored.messageCount,
-              currentMsgCount: messages.length,
-              before: prevContext ? {
-                systemPrompt: prevContext.systemPrompt,
-                messages: prevContext.messages,
-                model: prevContext.model,
-                msgCount: prevContext.messages.length,
-                capturedAt: new Date(prevContext.ts).toISOString(),
-              } : null,
-              after: {
-                systemPrompt: systemContext,
-                messages,
-                model,
-                msgCount: messages.length,
-              },
+              event: `session.${event}`, conversationId, model, sdkSessionId: stored.sdkSessionId,
+              storedMsgCount: stored.messageCount, currentMsgCount: messages.length,
+              before: prevContext ? { systemPrompt: prevContext.systemPrompt, messages: prevContext.messages, model: prevContext.model, msgCount: prevContext.messages.length, capturedAt: new Date(prevContext.ts).toISOString() } : null,
+              after: { systemPrompt: systemContext, messages, model, msgCount: messages.length },
             })
             logInfo("session.context_dumped", { reqId, event, path: dumpPath, msgCount: messages.length, hasBefore: !!prevContext })
             sessionStore.invalidate(conversationId)
           } else {
             resumeSessionId = stored.sdkSessionId
             isResuming = true
-            logInfo("session.resuming", {
-              reqId, conversationId, model,
-              storedModel: stored.model,
-              sdkSessionId: resumeSessionId,
-              storedMsgCount: stored.messageCount,
-              currentMsgCount: messages.length,
-              resumeCount: stored.resumeCount,
-              countDelta,
-            })
+            logInfo("session.resuming", { reqId, conversationId, model, storedModel: stored.model, sdkSessionId: resumeSessionId, storedMsgCount: stored.messageCount, currentMsgCount: messages.length, resumeCount: stored.resumeCount, countDelta })
           }
         }
       }
 
-      // Update last-context cache for this conversation (used in before/after dumps)
       if (conversationId) {
         lastContextCache.set(conversationId, { systemPrompt: systemContext, messages, model, ts: Date.now() })
-        // Evict oldest if cache is too large
         if (lastContextCache.size > MAX_CONTEXT_CACHE) {
           const oldest = [...lastContextCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0]
           if (oldest) lastContextCache.delete(oldest[0])
         }
       }
 
-      // Check if last user message contains images — if so, use native SDK multimodal input
+      // ── Build prompt input ─────────────────────────────────────────────
       const lastMsg = messages[messages.length - 1]!
       const lastMsgHasImages = contentHasImages(lastMsg.content)
+      const promptText = serializeContent(lastMsg.content)
+      const systemPrompt = (systemContext || "").trim() || undefined
+      const usage = newUsage()
 
-      // promptInput: either a string (text-only) or AsyncIterable<SDKUserMessage> (multimodal)
       let promptInput: string | AsyncIterable<any>
-      // promptText: always the text-only version for token counting and logging
-      promptText = serializeContent(lastMsg.content)
-      // Track real usage from SDK stream events
-      let sdkInputTokens = 0
-      let sdkOutputTokens = 0
-      let sdkCacheReadTokens = 0
-      let sdkCacheCreationTokens = 0
-
       if (isResuming && resumeSessionId) {
-        systemPrompt = (systemContext || "").trim() || undefined
-        if (lastMsgHasImages) {
-          promptInput = createSDKUserMessage(buildNativeContent(lastMsg.content), resumeSessionId)
-          logInfo("session.resume_with_images", { reqId, conversationId })
-        } else {
-          promptInput = promptText
-        }
-      } else {
-        // Single or multi-turn: always use just the last message as prompt.
-        // The client (openclaw) manages conversation context; the proxy is stateless.
-        // Prior turns are handled by SDK session resumption when available.
-        systemPrompt = (systemContext || "").trim() || undefined
         promptInput = lastMsgHasImages
-          ? createSDKUserMessage(buildNativeContent(lastMsg.content))
+          ? createSDKUserMessage(buildNativeContent(lastMsg.content), resumeSessionId)
           : promptText
+        if (lastMsgHasImages) logInfo("session.resume_with_images", { reqId, conversationId })
+      } else {
+        promptInput = lastMsgHasImages ? createSDKUserMessage(buildNativeContent(lastMsg.content)) : promptText
         if (lastMsgHasImages) logInfo("request.native_images", { reqId })
       }
 
       requestStarted = Date.now()
-
-      // Capture client info
-      const clientIp = c.req.header("x-forwarded-for")
-        ?? c.req.header("x-real-ip")
-        ?? c.req.header("cf-connecting-ip")
-        ?? "unknown"
+      const clientIp = c.req.header("x-forwarded-for") ?? c.req.header("x-real-ip") ?? c.req.header("cf-connecting-ip") ?? "unknown"
       const userAgent = c.req.header("user-agent") ?? "unknown"
       const bodyBytes = JSON.stringify(body).length
 
-      // ── Create trace ──────────────────────────────────────────────────────
-      trace = traceStore.create({
-        reqId,
-        model,
-        requestedModel: body.model || "sonnet",
-        stream,
-        hasTools,
-        thinking: thinking?.type,
-        promptLen: promptText.length,
-        systemLen: systemPrompt?.length ?? 0,
-        msgCount: messages.length,
-        bodyBytes,
-        clientIp,
-        userAgent,
-      })
-
-      // Attach session info to trace
+      trace = traceStore.create({ reqId, model, requestedModel: body.model || "sonnet", stream, hasTools, thinking: thinking?.type, promptLen: promptText.length, systemLen: systemPrompt?.length ?? 0, msgCount: messages.length, bodyBytes, clientIp, userAgent })
       if (conversationId) {
-        traceStore.setSession(reqId, {
-          conversationId,
-          sdkSessionId: resumeSessionId,
-          isResuming,
-          resumeCount: isResuming ? sessionStore.get(conversationId!)?.resumeCount : undefined,
-        })
+        traceStore.setSession(reqId, { conversationId, sdkSessionId: resumeSessionId, isResuming, resumeCount: isResuming ? sessionStore.get(conversationId!)?.resumeCount : undefined })
       }
 
       // ── Queue ─────────────────────────────────────────────────────────────
-      const queueActive = requestQueue.activeCount
-      const queueWaiting = requestQueue.waitingCount
-      const needsQueue = queueActive >= MAX_CONCURRENT
-
-      traceStore.phase(reqId, "queued", { queueActive, queueWaiting })
-
-      if (needsQueue) {
-        logInfo("queue.waiting", {
-          reqId,
-          model,
-          queueActive,
-          queueWaiting,
-          queueTimeoutMs: QUEUE_TIMEOUT_MS,
-        })
+      traceStore.phase(reqId, "queued", { queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
+      if (requestQueue.activeCount >= MAX_CONCURRENT) {
+        logInfo("queue.waiting", { reqId, model, queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount, queueTimeoutMs: QUEUE_TIMEOUT_MS })
       }
-
       await requestQueue.acquire()
-
       const queueWaitMs = Date.now() - requestStarted
       traceStore.phase(reqId, "acquired", { queueWaitMs })
-
-      logInfo("queue.acquired", {
-        reqId,
-        queueWaitMs,
-        queueActive: requestQueue.activeCount,
-        queueWaiting: requestQueue.waitingCount,
-      })
-
-      // Start timers AFTER queue acquire — queue wait doesn't count
+      logInfo("queue.acquired", { reqId, queueWaitMs, queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
       resetStallTimer()
       startHardTimer()
 
-      // ── Non-streaming ──────────────────────────────────────────────────────
+      // ── Non-streaming ──────────────────────────────────────────────────
       if (!stream) {
-        let fullText = ""
+        let result: Awaited<ReturnType<typeof runNonStreamSdkLoop>>
         let capturedSessionId: string | undefined
-        const queryOpts = buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers })
-        // For tool mode: capture native content blocks from stream events
-        const contentBlocks: any[] = []
-        let currentToolBlock: { id: string; name: string; jsonAccum: string } | null = null
-        let capturedStopReason: string | null = null
-        let sdkEventCount = 0
         try {
           traceStore.phase(reqId, "sdk_starting")
-          for await (const message of query({ prompt: promptInput, options: queryOpts })) {
-            sdkEventCount++
-            resetStallTimer()
-            traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
-            // Capture session_id from init message
-            if (message.type === "system" && (message as any).subtype === "init") {
-              capturedSessionId = (message as any).session_id
-            }
-            if (message.type === "result") {
-              const r = message as any
-              if (r.session_id) capturedSessionId = r.session_id
-              if (r.usage) {
-                sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
-              }
-            }
-            if (hasTools && message.type === "stream_event") {
-              const ev = (message as any).event as any
-              if (ev.type === "content_block_start") {
-                const cb = ev.content_block
-                if (cb?.type === "tool_use") {
-                  currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
-                } else if (cb?.type === "text") {
-                  contentBlocks.push({ type: "text", text: "" })
-                }
-              } else if (ev.type === "content_block_delta") {
-                if (ev.delta?.type === "text_delta") {
-                  const lastText = contentBlocks[contentBlocks.length - 1]
-                  if (lastText?.type === "text") {
-                    lastText.text += ev.delta.text ?? ""
-                  } else {
-                    contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
-                  }
-                  fullText += ev.delta.text ?? ""
-                } else if (ev.delta?.type === "input_json_delta" && currentToolBlock) {
-                  currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
-                }
-              } else if (ev.type === "content_block_stop") {
-                if (currentToolBlock) {
-                  let input: any = {}
-                  try { input = JSON.parse(currentToolBlock.jsonAccum) } catch {}
-                  contentBlocks.push({
-                    type: "tool_use",
-                    id: currentToolBlock.id,
-                    name: currentToolBlock.name,
-                    input,
-                  })
-                  currentToolBlock = null
-                }
-              } else if (ev.type === "message_delta") {
-                if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
-                if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
-                // Abort after all content blocks are complete (message_delta comes after all content_block_stop per API spec)
-                if (contentBlocks.some((b: any) => b.type === "tool_use") && !abortController.signal.aborted) {
-                  logInfo("sdk.abort_after_complete_response", { reqId, contentBlockCount: contentBlocks.length, stopReason: capturedStopReason })
-                  abortController.abort()
-                }
-              } else if (ev.type === "message_start" && ev.message?.usage) {
-                if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
-                if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
-                if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
-              }
-            } else if (!hasTools && message.type === "assistant") {
-              let turnText = ""
-              for (const block of message.message.content) {
-                if (block.type === "text") turnText += block.text
-              }
-              fullText = turnText
-              // Capture usage from assistant message
-              const msgUsage = (message as any).message?.usage
-              if (msgUsage?.input_tokens) sdkInputTokens = msgUsage.input_tokens
-              if (msgUsage?.output_tokens) sdkOutputTokens = msgUsage.output_tokens
-            }
-          }
+          result = await runNonStreamSdkLoop(promptInput, buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers }), hasTools, abortController, reqId, usage, resetStallTimer)
+          capturedSessionId = result.sessionId
           traceStore.phase(reqId, "sdk_done")
-          logInfo("request.content_summary", {
-            reqId, hasTools,
-            contentBlockCount: contentBlocks.length,
-            contentBlockTypes: contentBlocks.map((b: any) => b.type),
-            toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
-            textLength: fullText.length,
-            stopReason: capturedStopReason,
-            sdkEventCount,
-          })
-
-          // Store session mapping for future resumption
-          if (conversationId && capturedSessionId) {
-            if (isResuming) {
-              sessionStore.recordResume(conversationId!, messages.length, isCompacted)
-              logInfo("session.resumed_ok", { reqId, conversationId, sdkSessionId: capturedSessionId })
-            } else {
-              sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-              logInfo("session.created", { reqId, conversationId, sdkSessionId: capturedSessionId })
-            }
-          }
-        } catch (resumeErr) {
-          // Aborted SDK after message_delta (all blocks complete) — not an error
-          if (abortController.signal.aborted && contentBlocks.some((b: any) => b.type === "tool_use")) {
-            traceStore.phase(reqId, "sdk_done")
-            logInfo("sdk.aborted_after_tool_call_nonstream", { reqId, contentBlocks: contentBlocks.length })
-            logInfo("request.content_summary", {
-              reqId, hasTools,
-              contentBlockCount: contentBlocks.length,
-              contentBlockTypes: contentBlocks.map((b: any) => b.type),
-              toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
-              textLength: fullText.length,
-              stopReason: capturedStopReason,
-              sdkEventCount,
-            })
-            if (conversationId && capturedSessionId) {
-              if (isResuming) {
-                sessionStore.recordResume(conversationId!, messages.length, isCompacted)
-              } else {
-                sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-              }
-            }
-          } else if (isResuming && resumeSessionId) {
-            logWarn("session.resume_failed", {
-              reqId, conversationId, sdkSessionId: resumeSessionId,
-              error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
-            })
-            if (conversationId) {
-              sessionStore.recordFailure(conversationId!)
-              sessionStore.invalidate(conversationId!)
-            }
-
+          logInfo("request.content_summary", { reqId, hasTools, contentBlockCount: result.toolState.contentBlocks.length, textLength: result.fullText.length, stopReason: result.toolState.capturedStopReason, sdkEventCount: result.sdkEventCount, aborted: result.aborted })
+          saveSession(conversationId, capturedSessionId, isResuming, isCompacted, messages.length, model, reqId, isResuming ? "session.resumed_ok" : "session.created")
+        } catch (err) {
+          if (isResuming && resumeSessionId) {
+            logWarn("session.resume_failed", { reqId, conversationId, sdkSessionId: resumeSessionId, error: err instanceof Error ? (err as Error).message : String(err) })
+            if (conversationId) { sessionStore.recordFailure(conversationId!); sessionStore.invalidate(conversationId!) }
             logInfo("session.fallback_fresh", { reqId, conversationId })
-            // Reset accumulators and retry as a brand new session
-            contentBlocks.length = 0
-            currentToolBlock = null
-            capturedStopReason = null
-            fullText = ""
-            sdkEventCount = 0
             const fallbackAbort = new AbortController()
-            try {
-              for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController: fallbackAbort, thinking, mcpServers }) })) {
-                sdkEventCount++
-                resetStallTimer()
-                traceStore.sdkEvent(reqId, sdkEventCount, message.type, (message as any).event?.type ?? (message as any).message?.type)
-                if (message.type === "system" && (message as any).subtype === "init") {
-                  capturedSessionId = (message as any).session_id
-                }
-                if (message.type === "result") {
-                  const r = message as any
-                  if (r.session_id) capturedSessionId = r.session_id
-                  if (r.usage) {
-                    sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                    sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                    sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                    sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
-                  }
-                }
-                if (hasTools && message.type === "stream_event") {
-                  const ev = (message as any).event as any
-                  if (ev.type === "content_block_start") {
-                    const cb = ev.content_block
-                    if (cb?.type === "tool_use") {
-                      currentToolBlock = { id: cb.id, name: stripMcpPrefix(cb.name), jsonAccum: "" }
-                    } else if (cb?.type === "text") {
-                      contentBlocks.push({ type: "text", text: "" })
-                    }
-                  } else if (ev.type === "content_block_delta") {
-                    if (ev.delta?.type === "text_delta") {
-                      const lastText = contentBlocks[contentBlocks.length - 1]
-                      if (lastText?.type === "text") {
-                        lastText.text += ev.delta.text ?? ""
-                      } else {
-                        contentBlocks.push({ type: "text", text: ev.delta.text ?? "" })
-                      }
-                      fullText += ev.delta.text ?? ""
-                    } else if (ev.delta?.type === "input_json_delta" && currentToolBlock) {
-                      currentToolBlock.jsonAccum += ev.delta.partial_json ?? ""
-                    }
-                  } else if (ev.type === "content_block_stop") {
-                    if (currentToolBlock) {
-                      let input: any = {}
-                      try { input = JSON.parse(currentToolBlock.jsonAccum) } catch {}
-                      contentBlocks.push({ type: "tool_use", id: currentToolBlock.id, name: currentToolBlock.name, input })
-                      currentToolBlock = null
-                    }
-                  } else if (ev.type === "message_delta") {
-                    if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
-                    if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
-                    // Abort after all content blocks are complete
-                    if (contentBlocks.some((b: any) => b.type === "tool_use") && !fallbackAbort.signal.aborted) {
-                      logInfo("sdk.abort_after_complete_response_fallback", { reqId, contentBlockCount: contentBlocks.length, stopReason: capturedStopReason })
-                      fallbackAbort.abort()
-                    }
-                  } else if (ev.type === "message_start" && ev.message?.usage) {
-                    if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
-                    if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
-                    if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
-                  }
-                } else if (!hasTools && message.type === "assistant") {
-                  let turnText = ""
-                  for (const block of message.message.content) {
-                    if (block.type === "text") turnText += block.text
-                  }
-                  fullText = turnText
-                  const msgUsage = (message as any).message?.usage
-                  if (msgUsage?.input_tokens) sdkInputTokens = msgUsage.input_tokens
-                  if (msgUsage?.output_tokens) sdkOutputTokens = msgUsage.output_tokens
-                }
-              }
-              traceStore.phase(reqId, "sdk_done")
-              logInfo("request.content_summary", {
-                reqId, hasTools,
-                contentBlockCount: contentBlocks.length,
-                contentBlockTypes: contentBlocks.map((b: any) => b.type),
-                toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
-                textLength: fullText.length,
-                stopReason: capturedStopReason,
-                sdkEventCount,
-              })
-              if (conversationId && capturedSessionId) {
-                sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                logInfo("session.created_after_fallback", { reqId, conversationId, sdkSessionId: capturedSessionId })
-              }
-            } catch (fallbackErr) {
-              if (fallbackAbort.signal.aborted && contentBlocks.some((b: any) => b.type === "tool_use")) {
-                traceStore.phase(reqId, "sdk_done")
-                logInfo("sdk.aborted_after_tool_call_fallback_nonstream", { reqId, sdkEventCount, contentBlocks: contentBlocks.length })
-                logInfo("request.content_summary", {
-                  reqId, hasTools,
-                  contentBlockCount: contentBlocks.length,
-                  contentBlockTypes: contentBlocks.map((b: any) => b.type),
-                  toolNames: contentBlocks.filter((b: any) => b.type === "tool_use").map((b: any) => b.name),
-                  textLength: fullText.length,
-                  stopReason: capturedStopReason,
-                  sdkEventCount,
-                })
-                if (conversationId && capturedSessionId) {
-                  sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                }
-              } else {
-                throw fallbackErr
-              }
-            }
+            traceStore.phase(reqId, "sdk_starting")
+            result = await runNonStreamSdkLoop(promptInput, buildQueryOptions(model, { partial: hasTools, systemPrompt, abortController: fallbackAbort, thinking, mcpServers }), hasTools, fallbackAbort, reqId, usage, resetStallTimer)
+            capturedSessionId = result.sessionId
+            traceStore.phase(reqId, "sdk_done")
+            logInfo("request.content_summary", { reqId, hasTools, contentBlockCount: result.toolState.contentBlocks.length, textLength: result.fullText.length, stopReason: result.toolState.capturedStopReason, sdkEventCount: result.sdkEventCount, aborted: result.aborted })
+            saveSession(conversationId, capturedSessionId, false, false, messages.length, model, reqId, "session.created_after_fallback")
           } else {
-            throw resumeErr
+            throw err
           }
         } finally {
           clearStallTimer(); clearHardTimer()
           requestQueue.release()
-          logDebug("queue.released", {
-            reqId,
-            queueActive: requestQueue.activeCount,
-            queueWaiting: requestQueue.waitingCount,
-          })
+          logDebug("queue.released", { reqId, queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
         }
 
         traceStore.phase(reqId, "responding")
 
         if (hasTools) {
-          // Use native content blocks captured from stream events
+          const { contentBlocks, capturedStopReason } = result!.toolState
           const toolCallCount = contentBlocks.filter((b: any) => b.type === "tool_use").length
-          // Filter out empty text blocks
-          const content = contentBlocks.filter((b: any) => {
-            if (b.type === "text" && !b.text?.trim()) return false
-            return true
-          })
-          if (content.length === 0) content.push({ type: "text", text: fullText || "..." })
-
+          const content = contentBlocks.filter((b: any) => !(b.type === "text" && !b.text?.trim()))
+          if (content.length === 0) content.push({ type: "text", text: result!.fullText || "..." })
           const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
-
-          traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
-          traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
-
-          return c.json({
-            id: generateId("msg_"),
-            type: "message", role: "assistant", content,
-            model: body.model, stop_reason: stopReason, stop_sequence: null,
-            usage: buildUsage(sdkInputTokens, sdkOutputTokens, sdkCacheReadTokens, sdkCacheCreationTokens)
-          })
+          traceStore.setUsage(reqId, makeUsageObj(usage))
+          traceStore.complete(reqId, { outputLen: result!.fullText.length, toolCallCount })
+          return c.json({ id: generateId("msg_"), type: "message", role: "assistant", content, model: body.model, stop_reason: stopReason, stop_sequence: null, usage: buildUsage(usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheCreationTokens) })
         }
 
-        logDebug("usage.tokens", { reqId, sdkInput: sdkInputTokens, sdkOutput: sdkOutputTokens, cacheRead: sdkCacheReadTokens, cacheCreation: sdkCacheCreationTokens })
-
-        if (!fullText || !fullText.trim()) fullText = "..."
-        traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
+        const fullText = result!.fullText || "..."
+        traceStore.setUsage(reqId, makeUsageObj(usage))
         traceStore.complete(reqId, { outputLen: fullText.length })
-
-        return c.json({
-          id: generateId("msg_"),
-          type: "message", role: "assistant",
-          content: [{ type: "text", text: fullText }],
-          model: body.model, stop_reason: "end_turn", stop_sequence: null,
-          usage: buildUsage(sdkInputTokens, sdkOutputTokens, sdkCacheReadTokens, sdkCacheCreationTokens)
-        })
+        return c.json({ id: generateId("msg_"), type: "message", role: "assistant", content: [{ type: "text", text: fullText }], model: body.model, stop_reason: "end_turn", stop_sequence: null, usage: buildUsage(usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheCreationTokens) })
       }
 
-      // ── Streaming ──────────────────────────────────────────────────────────
+      // ── Streaming ──────────────────────────────────────────────────────
       const encoder = new TextEncoder()
       const readable = new ReadableStream({
         cancel() {
           clientDisconnected = true
-          logWarn("stream.client_disconnect", {
-            reqId,
-            phase: trace?.phase,
-            sdkEventCount: trace?.sdkEventCount,
-            outputLen: trace?.outputLen,
-            elapsedMs: trace ? Date.now() - trace.startedAt : undefined,
-            model: trace?.model,
-          })
+          logWarn("stream.client_disconnect", { reqId, phase: trace?.phase, sdkEventCount: trace?.sdkEventCount, outputLen: trace?.outputLen, elapsedMs: trace ? Date.now() - trace.startedAt : undefined, model: trace?.model })
           abortController.abort()
         },
         async start(controller) {
@@ -1204,11 +751,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             if (!queueReleased) {
               queueReleased = true
               requestQueue.release()
-              logDebug("queue.released", {
-                reqId,
-                queueActive: requestQueue.activeCount,
-                queueWaiting: requestQueue.waitingCount,
-              })
+              logDebug("queue.released", { reqId, queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
             }
           }
 
@@ -1218,50 +761,26 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
             } catch (e) {
               sseSendErrors++
-              if (sseSendErrors <= 3) {
-                logWarn("stream.sse_send_failed", {
-                  reqId,
-                  event,
-                  sseSendErrors,
-                  error: e instanceof Error ? e.message : String(e),
-                })
-              }
+              if (sseSendErrors <= 3) logWarn("stream.sse_send_failed", { reqId, event, sseSendErrors, error: e instanceof Error ? e.message : String(e) })
             }
           }
 
           try {
             const heartbeat = setInterval(() => {
-              try {
-                controller.enqueue(encoder.encode(`event: ping\ndata: {"type": "ping"}\n\n`))
-              } catch (e) {
-                logWarn("stream.heartbeat_failed", {
-                  reqId,
-                  error: e instanceof Error ? e.message : String(e),
-                  phase: trace?.phase,
-                  elapsedMs: trace ? Date.now() - trace.startedAt : undefined,
-                })
-                clearInterval(heartbeat)
-              }
+              try { controller.enqueue(encoder.encode(`event: ping\ndata: {"type": "ping"}\n\n`)) }
+              catch (e) { logWarn("stream.heartbeat_failed", { reqId, error: e instanceof Error ? e.message : String(e), phase: trace?.phase, elapsedMs: trace ? Date.now() - trace.startedAt : undefined }); clearInterval(heartbeat) }
             }, 15_000)
 
-            // Defer message_start until SDK provides real input_tokens
             let messageStartSent = false
             const emitMessageStart = () => {
               if (!messageStartSent) {
                 messageStartSent = true
-                sse("message_start", {
-                  type: "message_start",
-                  message: {
-                    id: messageId, type: "message", role: "assistant", content: [],
-                    model: body.model, stop_reason: null, stop_sequence: null,
-                    usage: buildUsage(sdkInputTokens, 1, sdkCacheReadTokens, sdkCacheCreationTokens)
-                  }
-                })
+                sse("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", content: [], model: body.model, stop_reason: null, stop_sequence: null, usage: buildUsage(usage.inputTokens, 1, usage.cacheReadTokens, usage.cacheCreationTokens) } })
               }
             }
 
             if (hasTools) {
-              // ── With tools: forward native SDK stream events directly as SSE ──
+              // ── Streaming with tools ─────────────────────────────────────
               let fullText = ""
               let blockIdx = 0
               let toolCallCount = 0
@@ -1269,27 +788,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               let hasEmittedAnyBlock = false
               let sdkEventCount = 0
               let lastEventAt = Date.now()
-              const stallLog = setInterval(() => {
-                const stallMs = Date.now() - lastEventAt
-                traceStore.stall(reqId, stallMs)
-              }, 15_000)
+              const stallLog = setInterval(() => { traceStore.stall(reqId, Date.now() - lastEventAt) }, 15_000)
               let capturedSessionId: string | undefined
-
-              // Helper to forward a stream event directly as SSE
-              // Track whether the current SDK content block was emitted (thinking blocks are skipped)
               let currentBlockEmitted = false
               let blockOpen = false
               let sseEventCount = 0
+
               const forwardStreamEvent = (ev: any) => {
                 sseEventCount++
-                if (ev.type === "message_start" && ev.message?.usage) {
-                  if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
-                  if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
-                  if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
-                  emitMessageStart()
-                  return
-                }
-                // Ensure message_start is sent before any content blocks
+                captureMessageStartUsage(ev, usage)
+                if (ev.type === "message_start") { emitMessageStart(); return }
                 emitMessageStart()
                 if (ev.type === "content_block_start") {
                   const cb = ev.content_block
@@ -1303,12 +811,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     blockOpen = true
                     sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })
                   } else {
-                    // Thinking or other block types — skip (don't emit SSE)
                     currentBlockEmitted = false
                   }
                   hasEmittedAnyBlock = hasEmittedAnyBlock || currentBlockEmitted
                 } else if (ev.type === "content_block_delta") {
-                  if (!currentBlockEmitted) return // Skip deltas for non-emitted blocks (thinking)
+                  if (!currentBlockEmitted) return
                   if (ev.delta?.type === "text_delta") {
                     fullText += ev.delta.text ?? ""
                     traceStore.updateOutput(reqId, fullText.length)
@@ -1318,434 +825,176 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: ev.delta.partial_json ?? "" } })
                   }
                 } else if (ev.type === "content_block_stop") {
-                  if (!currentBlockEmitted) return // Skip stop for non-emitted blocks (thinking)
+                  if (!currentBlockEmitted) return
                   sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
                   blockIdx++
                   blockOpen = false
                 } else if (ev.type === "message_delta") {
                   if (ev.delta?.stop_reason) capturedStopReason = ev.delta.stop_reason
-                  if (ev.usage?.output_tokens) sdkOutputTokens = ev.usage.output_tokens
+                  if (ev.usage?.output_tokens) usage.outputTokens = ev.usage.output_tokens
                 }
               }
 
-              // Mutable ref so forwardStreamEvent + abort logic can use the active controller
               let activeAbortController = abortController
 
-              try {
-                traceStore.phase(reqId, "sdk_starting")
-                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers }) })) {
+              const runStreamToolLoop = async (ac: AbortController, opts: any) => {
+                for await (const message of query({ prompt: promptInput, options: opts })) {
                   sdkEventCount++
                   lastEventAt = Date.now()
                   resetStallTimer()
                   const subtype = (message as any).event?.type ?? (message as any).message?.type
-                  if (message.type === "system" && (message as any).subtype === "init") {
-                    capturedSessionId = (message as any).session_id
-                  }
-                  if (message.type === "result") {
-                    const r = message as any
-                    if (r.session_id) capturedSessionId = r.session_id
-                    if (r.usage) {
-                      sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                      sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                      sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                      sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
-                    }
-                  }
+                  const sid = processSdkMessage(message, usage)
+                  if (sid) capturedSessionId = sid
                   if (message.type === "stream_event") {
                     const ev = (message as any).event as any
-                    if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
-                      traceStore.phase(reqId, "sdk_streaming")
-                    }
+                    if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) traceStore.phase(reqId, "sdk_streaming")
                     forwardStreamEvent(ev)
-                    // Abort after all content blocks are complete (message_delta comes after all content_block_stop)
-                    if (capturedStopReason && toolCallCount > 0 && !activeAbortController.signal.aborted) {
+                    if (capturedStopReason && toolCallCount > 0 && !ac.signal.aborted) {
                       logInfo("sdk.abort_after_complete_stream", { reqId, toolCallCount, blockIdx, stopReason: capturedStopReason })
-                      activeAbortController.abort()
+                      ac.abort()
                     }
                   }
                   traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
                 }
-                traceStore.phase(reqId, "sdk_done")
-                logInfo("request.content_summary", {
-                  reqId, hasTools: true,
-                  blockIdx, toolCallCount,
-                  textLength: fullText.length,
-                  stopReason: capturedStopReason,
-                  sdkEventCount,
-                })
+              }
 
-                // Store session mapping
-                if (conversationId && capturedSessionId) {
-                  if (isResuming) {
-                    sessionStore.recordResume(conversationId!, messages.length, isCompacted)
-                  } else {
-                    sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                  }
-                }
+              try {
+                traceStore.phase(reqId, "sdk_starting")
+                await runStreamToolLoop(abortController, buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId, mcpServers }))
+                traceStore.phase(reqId, "sdk_done")
+                logInfo("request.content_summary", { reqId, hasTools: true, blockIdx, toolCallCount, textLength: fullText.length, stopReason: capturedStopReason, sdkEventCount })
+                saveSession(conversationId, capturedSessionId, isResuming, isCompacted, messages.length, model, reqId)
               } catch (resumeErr) {
-                // Aborted SDK after message_delta (all blocks complete) — not an error
-                if (abortController.signal.aborted && toolCallCount > 0) {
+                if (activeAbortController.signal.aborted && toolCallCount > 0) {
                   traceStore.phase(reqId, "sdk_done")
                   logInfo("sdk.aborted_after_tool_call", { reqId, sdkEventCount, toolCallCount, outputLen: fullText.length })
-                  logInfo("request.content_summary", {
-                    reqId, hasTools: true,
-                    blockIdx, toolCallCount,
-                    textLength: fullText.length,
-                    stopReason: capturedStopReason,
-                    sdkEventCount,
-                  })
-                  if (conversationId && capturedSessionId) {
-                    if (isResuming) {
-                      sessionStore.recordResume(conversationId!, messages.length, isCompacted)
-                    } else {
-                      sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                    }
-                  }
+                  logInfo("request.content_summary", { reqId, hasTools: true, blockIdx, toolCallCount, textLength: fullText.length, stopReason: capturedStopReason, sdkEventCount })
+                  saveSession(conversationId, capturedSessionId, isResuming, isCompacted, messages.length, model, reqId)
                 } else if (isResuming && resumeSessionId) {
-                  logWarn("session.resume_failed_stream", {
-                    reqId, conversationId, sdkSessionId: resumeSessionId,
-                    error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
-                  })
-                  if (conversationId) {
-                    sessionStore.recordFailure(conversationId!)
-                    sessionStore.invalidate(conversationId!)
-                  }
-
+                  logWarn("session.resume_failed_stream", { reqId, conversationId, sdkSessionId: resumeSessionId, error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr) })
+                  if (conversationId) { sessionStore.recordFailure(conversationId!); sessionStore.invalidate(conversationId!) }
                   logInfo("session.fallback_fresh_stream", { reqId, conversationId })
-                  fullText = ""
-                  blockIdx = 0
-                  toolCallCount = 0
-                  capturedStopReason = null
-                  hasEmittedAnyBlock = false
-                  sdkEventCount = 0
+                  fullText = ""; blockIdx = 0; toolCallCount = 0; capturedStopReason = null; hasEmittedAnyBlock = false; sdkEventCount = 0
                   const fallbackAbort = new AbortController()
                   activeAbortController = fallbackAbort
                   try {
-                    for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController: fallbackAbort, thinking, mcpServers }) })) {
-                      sdkEventCount++
-                      lastEventAt = Date.now()
-                      resetStallTimer()
-                      const subtype = (message as any).event?.type ?? (message as any).message?.type
-                      if (message.type === "system" && (message as any).subtype === "init") {
-                        capturedSessionId = (message as any).session_id
-                      }
-                      if (message.type === "result") {
-                        const r = message as any
-                        if (r.session_id) capturedSessionId = r.session_id
-                        if (r.usage) {
-                          sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                          sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                          sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                          sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
-                        }
-                      }
-                      if (message.type === "stream_event") {
-                        const ev = (message as any).event as any
-                        if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
-                          traceStore.phase(reqId, "sdk_streaming")
-                        }
-                        forwardStreamEvent(ev)
-                        // Abort after all content blocks are complete
-                        if (capturedStopReason && toolCallCount > 0 && !activeAbortController.signal.aborted) {
-                          logInfo("sdk.abort_after_complete_stream_fallback", { reqId, toolCallCount, blockIdx, stopReason: capturedStopReason })
-                          activeAbortController.abort()
-                        }
-                      }
-                      traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
-                    }
+                    await runStreamToolLoop(fallbackAbort, buildQueryOptions(model, { partial: true, systemPrompt, abortController: fallbackAbort, thinking, mcpServers }))
                     traceStore.phase(reqId, "sdk_done")
-                    logInfo("request.content_summary", {
-                      reqId, hasTools: true,
-                      blockIdx, toolCallCount,
-                      textLength: fullText.length,
-                      stopReason: capturedStopReason,
-                      sdkEventCount,
-                    })
-                    if (conversationId && capturedSessionId) {
-                      sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                      logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId })
-                    }
+                    logInfo("request.content_summary", { reqId, hasTools: true, blockIdx, toolCallCount, textLength: fullText.length, stopReason: capturedStopReason, sdkEventCount })
+                    saveSession(conversationId, capturedSessionId, false, false, messages.length, model, reqId, "session.created_after_fallback_stream")
                   } catch (fallbackErr) {
                     if (fallbackAbort.signal.aborted && toolCallCount > 0) {
                       traceStore.phase(reqId, "sdk_done")
                       logInfo("sdk.aborted_after_tool_call_fallback_stream", { reqId, sdkEventCount, toolCallCount, outputLen: fullText.length })
-                      logInfo("request.content_summary", {
-                        reqId, hasTools: true,
-                        blockIdx, toolCallCount,
-                        textLength: fullText.length,
-                        stopReason: capturedStopReason,
-                        sdkEventCount,
-                      })
-                      if (conversationId && capturedSessionId) {
-                        sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
-                      }
-                    } else {
-                      throw fallbackErr
-                    }
+                      logInfo("request.content_summary", { reqId, hasTools: true, blockIdx, toolCallCount, textLength: fullText.length, stopReason: capturedStopReason, sdkEventCount })
+                      saveSession(conversationId, capturedSessionId, false, false, messages.length, model, reqId)
+                    } else { throw fallbackErr }
                   }
-                } else {
-                  throw resumeErr
-                }
+                } else { throw resumeErr }
               } finally {
-                clearInterval(stallLog)
-                clearInterval(heartbeat)
-                clearStallTimer(); clearHardTimer()
-                releaseQueue()
+                clearInterval(stallLog); clearInterval(heartbeat); clearStallTimer(); clearHardTimer(); releaseQueue()
               }
 
               traceStore.phase(reqId, "responding")
-
-              // Ensure message_start is sent even if no SDK events came
               emitMessageStart()
-
-              // If no blocks were emitted at all, emit a placeholder text block
               if (!hasEmittedAnyBlock) {
                 sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
                 sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
                 sse("content_block_stop", { type: "content_block_stop", index: 0 })
               }
-
-              // Close any block left open by abort/interrupt truncating the stream
               if (blockOpen) {
                 logWarn("stream.closing_orphaned_block", { reqId, blockIdx })
                 sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
-                blockIdx++
-                blockOpen = false
+                blockIdx++; blockOpen = false
               }
-
               const stopReason = toolCallCount > 0 ? "tool_use" : (capturedStopReason ?? "end_turn")
-              sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: sdkOutputTokens } })
+              sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.outputTokens } })
               sse("message_stop", { type: "message_stop" })
               logInfo("sse.summary", { reqId, sseEventCount, blockIdx, toolCallCount })
               controller.close()
-
-              traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
+              traceStore.setUsage(reqId, makeUsageObj(usage))
               traceStore.complete(reqId, { outputLen: fullText.length, toolCallCount })
               return
             }
 
-            // ── No tools: stream text deltas directly ─────────────────────
+            // ── Streaming without tools ─────────────────────────────────────
             let contentBlockStartSent = false
-
             let fullText = ""
             let hasStreamed = false
             let sdkEventCount = 0
             let lastEventAt = Date.now()
             let capturedSessionId2: string | undefined
-            const stallLog = setInterval(() => {
-              const stallMs = Date.now() - lastEventAt
-              traceStore.stall(reqId, stallMs)
-            }, 15_000)
-            try {
-              traceStore.phase(reqId, "sdk_starting")
-              for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }) })) {
+            const stallLog = setInterval(() => { traceStore.stall(reqId, Date.now() - lastEventAt) }, 15_000)
+
+            const processStreamNoToolsEvent = (ev: any) => {
+              captureMessageStartUsage(ev, usage)
+              if (ev.type === "message_start") { emitMessageStart(); return }
+              if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) traceStore.phase(reqId, "sdk_streaming")
+              if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+                const text = ev.delta.text ?? ""
+                if (text) {
+                  emitMessageStart()
+                  if (!contentBlockStartSent) { contentBlockStartSent = true; sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) }
+                  fullText += text
+                  hasStreamed = true
+                  traceStore.updateOutput(reqId, fullText.length)
+                  checkOutputSize(fullText.length)
+                  sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
+                }
+              } else if (ev.type === "message_delta" && ev.usage?.output_tokens) {
+                usage.outputTokens = ev.usage.output_tokens
+              }
+            }
+
+            const runStreamNoToolsLoop = async (opts: any) => {
+              for await (const message of query({ prompt: promptInput, options: opts })) {
                 sdkEventCount++
                 lastEventAt = Date.now()
                 resetStallTimer()
                 const subtype = (message as any).event?.type ?? (message as any).message?.type
-                // Capture session_id from init message
-                if (message.type === "system" && (message as any).subtype === "init") {
-                  capturedSessionId2 = (message as any).session_id
-                }
-                if (message.type === "result") {
-                  const r = message as any
-                  if (r.session_id) capturedSessionId2 = r.session_id
-                  if (r.usage) {
-                    sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                    sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                    sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                    sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
-                  }
-                }
-                if (message.type === "stream_event") {
-                  const ev = message.event as any
-                  // Capture usage from SDK message_start (real input tokens)
-                  if (ev.type === "message_start" && ev.message?.usage) {
-                    if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
-                    if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
-                    if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
-                    emitMessageStart()
-                  }
-                  // Detect first content event BEFORE sdkEvent records it
-                  if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
-                    traceStore.phase(reqId, "sdk_streaming")
-                  }
-                  if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                    const text = ev.delta.text ?? ""
-                    if (text) {
-                      // Ensure message_start and content_block_start are sent before first delta
-                      emitMessageStart()
-                      if (!contentBlockStartSent) {
-                        contentBlockStartSent = true
-                        sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
-                      }
-                      fullText += text
-                      hasStreamed = true
-                      traceStore.updateOutput(reqId, fullText.length)
-                      checkOutputSize(fullText.length)
-                      sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
-                    }
-                  } else if (ev.type === "message_delta" && ev.usage?.output_tokens) {
-                    sdkOutputTokens = ev.usage.output_tokens
-                  }
-                }
+                const sid = processSdkMessage(message, usage)
+                if (sid) capturedSessionId2 = sid
+                if (message.type === "stream_event") processStreamNoToolsEvent((message as any).event as any)
                 traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
               }
+            }
+
+            try {
+              traceStore.phase(reqId, "sdk_starting")
+              await runStreamNoToolsLoop(buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking, resume: resumeSessionId }))
               traceStore.phase(reqId, "sdk_done")
-
-              // Store session mapping
-              if (conversationId && capturedSessionId2) {
-                if (isResuming) {
-                  sessionStore.recordResume(conversationId!, messages.length, isCompacted)
-                } else {
-                  sessionStore.set(conversationId!, capturedSessionId2, model, messages.length)
-                }
-              }
+              saveSession(conversationId, capturedSessionId2, isResuming, isCompacted, messages.length, model, reqId)
             } catch (resumeErr) {
-              // Resume failed — start a fresh session (no history reconstruction)
               if (isResuming && resumeSessionId) {
-                logWarn("session.resume_failed_stream", {
-                  reqId, conversationId, sdkSessionId: resumeSessionId,
-                  error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr),
-                })
-                if (conversationId) {
-                  sessionStore.recordFailure(conversationId!)
-                  sessionStore.invalidate(conversationId!)
-                }
-
+                logWarn("session.resume_failed_stream", { reqId, conversationId, sdkSessionId: resumeSessionId, error: resumeErr instanceof Error ? resumeErr.message : String(resumeErr) })
+                if (conversationId) { sessionStore.recordFailure(conversationId!); sessionStore.invalidate(conversationId!) }
                 logInfo("session.fallback_fresh_stream", { reqId, conversationId })
                 sdkEventCount = 0
-                for await (const message of query({ prompt: promptInput, options: buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }) })) {
-                  sdkEventCount++
-                  lastEventAt = Date.now()
-                  resetStallTimer()
-                  const subtype = (message as any).event?.type ?? (message as any).message?.type
-                  if (message.type === "system" && (message as any).subtype === "init") {
-                    capturedSessionId2 = (message as any).session_id
-                  }
-                  if (message.type === "result") {
-                    const r = message as any
-                    if (r.session_id) capturedSessionId2 = r.session_id
-                    if (r.usage) {
-                      sdkInputTokens = r.usage.input_tokens ?? sdkInputTokens
-                      sdkOutputTokens = r.usage.output_tokens ?? sdkOutputTokens
-                      sdkCacheReadTokens = r.usage.cache_read_input_tokens ?? sdkCacheReadTokens
-                      sdkCacheCreationTokens = r.usage.cache_creation_input_tokens ?? sdkCacheCreationTokens
-                    }
-                  }
-                  if (message.type === "stream_event") {
-                    const ev = message.event as any
-                    if (ev.type === "message_start" && ev.message?.usage) {
-                      if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
-                      if (ev.message.usage.cache_read_input_tokens) sdkCacheReadTokens = ev.message.usage.cache_read_input_tokens
-                      if (ev.message.usage.cache_creation_input_tokens) sdkCacheCreationTokens = ev.message.usage.cache_creation_input_tokens
-                      emitMessageStart()
-                    }
-                    if (!trace!.firstTokenAt && (ev.type === "content_block_delta" || ev.type === "content_block_start")) {
-                      traceStore.phase(reqId, "sdk_streaming")
-                    }
-                    if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
-                      const text = ev.delta.text ?? ""
-                      if (text) {
-                        emitMessageStart()
-                        if (!contentBlockStartSent) {
-                          contentBlockStartSent = true
-                          sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
-                        }
-                        fullText += text
-                        hasStreamed = true
-                        traceStore.updateOutput(reqId, fullText.length)
-                        checkOutputSize(fullText.length)
-                        sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
-                      }
-                    } else if (ev.type === "message_delta" && ev.usage?.output_tokens) {
-                      sdkOutputTokens = ev.usage.output_tokens
-                    }
-                  }
-                  traceStore.sdkEvent(reqId, sdkEventCount, message.type, subtype)
-                }
+                await runStreamNoToolsLoop(buildQueryOptions(model, { partial: true, systemPrompt, abortController, thinking }))
                 traceStore.phase(reqId, "sdk_done")
-                if (conversationId && capturedSessionId2) {
-                  sessionStore.set(conversationId!, capturedSessionId2, model, messages.length)
-                  logInfo("session.created_after_fallback_stream", { reqId, conversationId, sdkSessionId: capturedSessionId2 })
-                }
-              } else {
-                throw resumeErr
-              }
+                saveSession(conversationId, capturedSessionId2, false, false, messages.length, model, reqId, "session.created_after_fallback_stream")
+              } else { throw resumeErr }
             } finally {
-              clearInterval(stallLog)
-              clearInterval(heartbeat)
-              clearStallTimer(); clearHardTimer()
-              // (temp files no longer used — images passed natively)
-              releaseQueue()
+              clearInterval(stallLog); clearInterval(heartbeat); clearStallTimer(); clearHardTimer(); releaseQueue()
             }
 
-            // Ensure message_start and content_block_start are emitted even if no stream events came
             emitMessageStart()
-            if (!contentBlockStartSent) {
-              contentBlockStartSent = true
-              sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
-            }
-
-            if (!hasStreamed) {
-              sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
-            }
-
+            if (!contentBlockStartSent) { contentBlockStartSent = true; sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) }
+            if (!hasStreamed) sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "..." } })
             sse("content_block_stop", { type: "content_block_stop", index: 0 })
-            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: sdkOutputTokens } })
+            sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: usage.outputTokens } })
             sse("message_stop", { type: "message_stop" })
             controller.close()
-
-            traceStore.setUsage(reqId, { input_tokens: sdkInputTokens, output_tokens: sdkOutputTokens, ...(sdkCacheReadTokens > 0 ? { cache_read_input_tokens: sdkCacheReadTokens } : {}), ...(sdkCacheCreationTokens > 0 ? { cache_creation_input_tokens: sdkCacheCreationTokens } : {}) })
+            traceStore.setUsage(reqId, makeUsageObj(usage))
             traceStore.complete(reqId, { outputLen: fullText.length })
 
           } catch (error) {
-            clearStallTimer(); clearHardTimer()
-            releaseQueue()
+            clearStallTimer(); clearHardTimer(); releaseQueue()
             const err = error instanceof Error ? error : new Error(String(error))
-            const isAbort = err.name === "AbortError" || err.message?.includes("abort")
-            const isQueueTimeout = err.message.includes("Queue timeout")
-
-            let errMsg: string
-            let errType: string
-            if (clientDisconnected) {
-              errMsg = "Client disconnected during streaming."
-              errType = "api_error"
-            } else if (abortReason === "max_duration") {
-              errMsg = `Request exceeded max duration of ${finalConfig.maxDurationMs / 1000}s. Output: ${trace?.outputLen ?? 0} chars.`
-              errType = "api_error"
-            } else if (abortReason === "max_output") {
-              errMsg = `Request exceeded max output size of ${finalConfig.maxOutputChars} chars.`
-              errType = "api_error"
-            } else if (isAbort) {
-              errMsg = `Request stalled — no SDK activity for ${finalConfig.stallTimeoutMs / 1000}s. Please retry.`
-              errType = "api_error"
-            } else if (isQueueTimeout) {
-              errMsg = "Server busy — all request slots are occupied. Please retry shortly."
-              errType = "overloaded_error"
-            } else {
-              errMsg = err.message
-              errType = "api_error"
-            }
-
-            // Trace the failure with full context
-            traceStore.fail(reqId, err, "error", {
-              clientDisconnect: clientDisconnected,
-              abortReason,
-              aborted: isAbort,
-              queueTimeout: isQueueTimeout,
-              stallTimeoutMs: finalConfig.stallTimeoutMs,
-              maxDurationMs: finalConfig.maxDurationMs,
-              maxOutputChars: finalConfig.maxOutputChars,
-              sseSendErrors,
-            })
-
-            // (temp files no longer used — images passed natively)
+            const classified = classifyError(err, { clientDisconnected, abortReason, stallTimeoutMs: finalConfig.stallTimeoutMs, maxDurationMs: finalConfig.maxDurationMs, maxOutputChars: finalConfig.maxOutputChars, outputLen: trace?.outputLen })
+            traceStore.fail(reqId, err, "error", { clientDisconnect: clientDisconnected, abortReason, aborted: err.name === "AbortError" || err.message?.includes("abort"), queueTimeout: err.message.includes("Queue timeout"), stallTimeoutMs: finalConfig.stallTimeoutMs, maxDurationMs: finalConfig.maxDurationMs, maxOutputChars: finalConfig.maxOutputChars, sseSendErrors })
             if (!clientDisconnected) {
-              try {
-                sse("error", { type: "error", error: { type: errType, message: errMsg }, request_id: reqId })
-                controller.close()
-              } catch {}
+              try { sse("error", { type: "error", error: { type: classified.type, message: classified.message }, request_id: reqId }); controller.close() } catch {}
             } else {
               try { controller.close() } catch {}
             }
@@ -1753,63 +1002,19 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       })
 
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        }
-      })
+      return new Response(readable, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } })
 
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error))
-      const isAbort = err.name === "AbortError" || err.message?.includes("abort")
-      const isQueueTimeout = err.message.includes("Queue timeout")
-
-      let errMsg: string
-      let errType: string
-      if (clientDisconnected) {
-        errMsg = "Client disconnected."
-        errType = "api_error"
-      } else if (abortReason === "max_duration") {
-        errMsg = `Request exceeded max duration of ${finalConfig.maxDurationMs / 1000}s.`
-        errType = "api_error"
-      } else if (abortReason === "max_output") {
-        errMsg = `Request exceeded max output size of ${finalConfig.maxOutputChars} chars.`
-        errType = "api_error"
-      } else if (isAbort) {
-        errMsg = `Request stalled — no SDK activity for ${finalConfig.stallTimeoutMs / 1000}s. Please retry.`
-        errType = "api_error"
-      } else if (isQueueTimeout) {
-        errMsg = "Server busy — all request slots are occupied. Please retry shortly."
-        errType = "overloaded_error"
-      } else {
-        errMsg = err.message
-        errType = "api_error"
-      }
-
-      // Trace the failure
+      const classified = classifyError(err, { clientDisconnected, abortReason, stallTimeoutMs: finalConfig.stallTimeoutMs, maxDurationMs: finalConfig.maxDurationMs, maxOutputChars: finalConfig.maxOutputChars })
       if (trace) {
-        traceStore.fail(reqId, err, "error", {
-          clientDisconnect: clientDisconnected,
-          aborted: isAbort,
-          queueTimeout: isQueueTimeout,
-        })
+        traceStore.fail(reqId, err, "error", { clientDisconnect: clientDisconnected, aborted: err.name === "AbortError" || err.message?.includes("abort"), queueTimeout: err.message.includes("Queue timeout") })
       } else {
-        logError("request.error.no_trace", { reqId, error: errMsg, stack: err.stack })
+        logError("request.error.no_trace", { reqId, error: classified.message, stack: err.stack })
       }
-
-      if (isQueueTimeout) {
-        return new Response(JSON.stringify({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }), {
-          status: 529, headers: { "Content-Type": "application/json" }
-        })
-      }
-      if (isAbort) {
-        return new Response(JSON.stringify({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }), {
-          status: 504, headers: { "Content-Type": "application/json" }
-        })
-      }
-      return c.json({ type: "error", error: { type: errType, message: errMsg }, request_id: reqId }, 500)
+      return new Response(JSON.stringify({ type: "error", error: { type: classified.type, message: classified.message }, request_id: reqId }), {
+        status: classified.status, headers: { "Content-Type": "application/json" }
+      })
     }
   }
 
@@ -1817,145 +1022,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
   app.post("/messages", handleMessages)
 
   // Stub: batches API not supported
-  const handleBatches = (c: Context) => c.json({
-    type: "error",
-    error: { type: "not_implemented_error", message: "Batches API is not supported by this proxy" }
-  }, 501)
+  const handleBatches = (c: Context) => c.json({ type: "error", error: { type: "not_implemented_error", message: "Batches API is not supported by this proxy" } }, 501)
   app.post("/v1/messages/batches", handleBatches)
   app.get("/v1/messages/batches", handleBatches)
   app.get("/v1/messages/batches/:id", handleBatches)
 
   // ── OpenAI-compatible /v1/chat/completions ─────────────────────────────
 
-  function convertOpenaiContent(content: any): any {
-    if (typeof content === "string") return content
-    if (!Array.isArray(content)) return String(content ?? "")
-
-    return content.map((part: any) => {
-      if (part.type === "text") return { type: "text", text: part.text ?? "" }
-      if (part.type === "image_url" && part.image_url?.url) {
-        const url = part.image_url.url as string
-        const dataMatch = url.match(/^data:(image\/\w+);base64,(.+)$/)
-        if (dataMatch) {
-          return {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: dataMatch[1]!,
-              data: dataMatch[2]!
-            }
-          }
-        }
-        return {
-          type: "image",
-          source: { type: "url", url }
-        }
-      }
-      return part
-    })
-  }
-
-  function openaiToAnthropicMessages(messages: any[]): { system?: string; messages: any[] } {
-    let system: string | undefined
-    const converted: any[] = []
-
-    for (const msg of messages) {
-      if (msg.role === "system") {
-        const sysText = typeof msg.content === "string" ? msg.content
-          : Array.isArray(msg.content) ? msg.content.filter((p: any) => p.type === "text").map((p: any) => p.text ?? "").join("")
-          : String(msg.content ?? "")
-        system = (system ? system + "\n" : "") + sysText
-      } else if (msg.role === "user") {
-        converted.push({ role: "user", content: convertOpenaiContent(msg.content) })
-      } else if (msg.role === "assistant") {
-        if (msg.tool_calls?.length) {
-          const content: any[] = []
-          if (msg.content) content.push({ type: "text", text: msg.content })
-          for (const tc of msg.tool_calls) {
-            content.push({
-              type: "tool_use",
-              id: tc.id,
-              name: tc.function?.name ?? "",
-              input: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}
-            })
-          }
-          converted.push({ role: "assistant", content })
-        } else {
-          converted.push({ role: "assistant", content: msg.content ?? "" })
-        }
-      } else if (msg.role === "tool") {
-        converted.push({
-          role: "user",
-          content: [{
-            type: "tool_result",
-            tool_use_id: msg.tool_call_id,
-            content: msg.content ?? ""
-          }]
-        })
-      }
-    }
-    return { system, messages: converted }
-  }
-
-  function openaiToAnthropicTools(tools: any[]): any[] {
-    return tools
-      .filter((t: any) => t.type === "function" && t.function)
-      .map((t: any) => ({
-        name: t.function.name,
-        description: t.function.description ?? "",
-        input_schema: t.function.parameters ?? { type: "object", properties: {} }
-      }))
-  }
-
-  function anthropicToOpenaiResponse(anthropicBody: any, model: string): any {
-    const textBlocks = (anthropicBody.content ?? []).filter((b: any) => b.type === "text")
-    const toolBlocks = (anthropicBody.content ?? []).filter((b: any) => b.type === "tool_use")
-
-    const text = textBlocks.map((b: any) => b.text).join("") || (toolBlocks.length > 0 ? null : "")
-
-    const message: any = { role: "assistant", content: text }
-
-    if (toolBlocks.length > 0) {
-      message.tool_calls = toolBlocks.map((b: any, i: number) => ({
-        id: b.id,
-        type: "function",
-        function: {
-          name: b.name,
-          arguments: JSON.stringify(b.input ?? {})
-        }
-      }))
-    }
-
-    const finishReason = anthropicBody.stop_reason === "tool_use" ? "tool_calls"
-      : anthropicBody.stop_reason === "max_tokens" ? "length"
-      : "stop"
-
-    return {
-      id: generateId("chatcmpl-"),
-      object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{
-        index: 0,
-        message,
-        finish_reason: finishReason
-      }],
-      usage: {
-        prompt_tokens: anthropicBody.usage?.input_tokens ?? 0,
-        completion_tokens: anthropicBody.usage?.output_tokens ?? 0,
-        total_tokens: (anthropicBody.usage?.input_tokens ?? 0) + (anthropicBody.usage?.output_tokens ?? 0)
-      }
-    }
-  }
-
   const handleChatCompletions = async (c: Context) => {
     try {
       let body: any
-      try {
-        body = await c.req.json()
-      } catch {
-        return c.json({ error: { message: "Request body must be valid JSON", type: "invalid_request_error" } }, 400)
-      }
+      try { body = await c.req.json() }
+      catch { return c.json({ error: { message: "Request body must be valid JSON", type: "invalid_request_error" } }, 400) }
 
       if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
         return c.json({ error: { message: "messages is required and must be a non-empty array", type: "invalid_request_error" } }, 400)
@@ -1965,21 +1043,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
       const stream = body.stream ?? false
       const requestedModel = body.model ?? "claude-sonnet-4-6"
 
-      const anthropicBody: any = {
-        model: requestedModel,
-        messages,
-        stream,
-      }
+      const anthropicBody: any = { model: requestedModel, messages, stream }
       if (system) anthropicBody.system = system
-      if (body.max_tokens || body.max_completion_tokens) {
-        anthropicBody.max_tokens = body.max_tokens ?? body.max_completion_tokens
-      }
+      if (body.max_tokens || body.max_completion_tokens) anthropicBody.max_tokens = body.max_tokens ?? body.max_completion_tokens
       if (body.temperature !== undefined) anthropicBody.temperature = body.temperature
       if (body.top_p !== undefined) anthropicBody.top_p = body.top_p
       if (body.stop) anthropicBody.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop]
-      if (body.tools?.length) {
-        anthropicBody.tools = openaiToAnthropicTools(body.tools)
-      }
+      if (body.tools?.length) anthropicBody.tools = openaiToAnthropicTools(body.tools)
 
       const internalHeaders: Record<string, string> = { "Content-Type": "application/json" }
       const authHeader = c.req.header("authorization") ?? c.req.header("x-api-key")
@@ -1987,28 +1057,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         if (c.req.header("authorization")) internalHeaders["authorization"] = authHeader
         else internalHeaders["x-api-key"] = authHeader
       }
-      const internalRes = await app.fetch(new Request(`http://localhost/v1/messages`, {
-        method: "POST",
-        headers: internalHeaders,
-        body: JSON.stringify(anthropicBody)
-      }))
+      const internalRes = await app.fetch(new Request(`http://localhost/v1/messages`, { method: "POST", headers: internalHeaders, body: JSON.stringify(anthropicBody) }))
 
       if (!stream) {
         const anthropicJson = await internalRes.json() as any
-        if (anthropicJson.type === "error") {
-          return c.json({ error: anthropicJson.error }, internalRes.status as any)
-        }
-        return c.json(anthropicToOpenaiResponse(anthropicJson, requestedModel))
+        if (anthropicJson.type === "error") return c.json({ error: anthropicJson.error }, internalRes.status as any)
+        return c.json(anthropicToOpenaiResponse(anthropicJson, requestedModel, generateId("chatcmpl-")))
       }
 
       const includeUsage = body.stream_options?.include_usage === true
-      const encoder = new TextEncoder()
       const readable = new ReadableStream({
         async start(controller) {
           try {
             const reader = internalRes.body?.getReader()
             if (!reader) { controller.close(); return }
-
             const decoder = new TextDecoder()
             let buffer = ""
             const chatId = generateId("chatcmpl-")
@@ -2023,7 +1085,6 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               const { done, value } = await reader.read()
               if (done) break
               buffer += decoder.decode(value, { stream: true })
-
               const lines = buffer.split("\n")
               buffer = lines.pop() ?? ""
 
@@ -2034,61 +1095,33 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
                   if (!sentRole && (event.type === "content_block_start" || event.type === "content_block_delta")) {
                     sentRole = true
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
-                      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]
-                    })}\n\n`))
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created, model: requestedModel, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`))
                   }
 
                   if (event.type === "content_block_start" && event.content_block?.type === "tool_use") {
                     const idx = toolCallIndex++
                     activeToolCalls.set(event.index, { id: event.content_block.id, name: event.content_block.name })
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
-                      choices: [{ index: 0, delta: {
-                        tool_calls: [{ index: idx, id: event.content_block.id, type: "function", function: { name: event.content_block.name, arguments: "" } }]
-                      }, finish_reason: null }]
-                    })}\n\n`))
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created, model: requestedModel, choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: event.content_block.id, type: "function", function: { name: event.content_block.name, arguments: "" } }] }, finish_reason: null }] })}\n\n`))
                   } else if (event.type === "content_block_delta" && event.delta?.type === "input_json_delta") {
                     const tc = activeToolCalls.get(event.index)
                     if (tc) {
                       const idx = Array.from(activeToolCalls.keys()).indexOf(event.index)
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                        id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
-                        choices: [{ index: 0, delta: {
-                          tool_calls: [{ index: idx, function: { arguments: event.delta.partial_json } }]
-                        }, finish_reason: null }]
-                      })}\n\n`))
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created, model: requestedModel, choices: [{ index: 0, delta: { tool_calls: [{ index: idx, function: { arguments: event.delta.partial_json } }] }, finish_reason: null }] })}\n\n`))
                     }
                   } else if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
-                      choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }]
-                    })}\n\n`))
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ id: chatId, object: "chat.completion.chunk", created, model: requestedModel, choices: [{ index: 0, delta: { content: event.delta.text }, finish_reason: null }] })}\n\n`))
                   } else if (event.type === "message_delta") {
                     const sr = event.delta?.stop_reason
                     finishReason = sr === "tool_use" ? "tool_calls" : sr === "max_tokens" ? "length" : "stop"
                     if (event.usage) {
-                      const prevInput: number = usageInfo?.input_tokens ?? 0
-                      const prevOutput: number = usageInfo?.output_tokens ?? 0
-                      usageInfo = {
-                        input_tokens: event.usage.input_tokens ?? prevInput,
-                        output_tokens: event.usage.output_tokens ?? prevOutput
-                      }
+                      usageInfo = { input_tokens: event.usage.input_tokens ?? usageInfo?.input_tokens ?? 0, output_tokens: event.usage.output_tokens ?? usageInfo?.output_tokens ?? 0 }
                     }
                   } else if (event.type === "message_start" && event.message?.usage) {
                     usageInfo = { input_tokens: event.message.usage.input_tokens ?? 0, output_tokens: 0 }
                   } else if (event.type === "message_stop") {
-                    const finalChunk: any = {
-                      id: chatId, object: "chat.completion.chunk", created, model: requestedModel,
-                      choices: [{ index: 0, delta: {}, finish_reason: finishReason ?? "stop" }]
-                    }
+                    const finalChunk: any = { id: chatId, object: "chat.completion.chunk", created, model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: finishReason ?? "stop" }] }
                     if (includeUsage && usageInfo) {
-                      finalChunk.usage = {
-                        prompt_tokens: usageInfo.input_tokens,
-                        completion_tokens: usageInfo.output_tokens,
-                        total_tokens: usageInfo.input_tokens + usageInfo.output_tokens
-                      }
+                      finalChunk.usage = { prompt_tokens: usageInfo.input_tokens, completion_tokens: usageInfo.output_tokens, total_tokens: usageInfo.input_tokens + usageInfo.output_tokens }
                     }
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`))
                     controller.enqueue(encoder.encode("data: [DONE]\n\n"))
@@ -2097,46 +1130,21 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               }
             }
             controller.close()
-          } catch {
-            controller.close()
-          }
+          } catch { controller.close() }
         }
       })
 
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive"
-        }
-      })
+      return new Response(readable, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" } })
     } catch (error) {
-      return c.json({
-        error: { message: error instanceof Error ? error.message : "Unknown error", type: "server_error" }
-      }, 500)
+      return c.json({ error: { message: error instanceof Error ? error.message : "Unknown error", type: "server_error" } }, 500)
     }
   }
 
   app.post("/v1/chat/completions", handleChatCompletions)
   app.post("/chat/completions", handleChatCompletions)
+  app.get("/v1/chat/models", (c) => c.json({ object: "list", data: MODELS.map(m => ({ id: m.id, object: "model", created: Math.floor(new Date(m.created_at).getTime() / 1000), owned_by: "anthropic" })) }))
 
-  // OpenAI-format model listing
-  const handleOpenaiModels = (c: Context) => c.json({
-    object: "list",
-    data: MODELS.map(m => ({
-      id: m.id,
-      object: "model",
-      created: Math.floor(new Date(m.created_at).getTime() / 1000),
-      owned_by: "anthropic"
-    }))
-  })
-  app.get("/v1/chat/models", handleOpenaiModels)
-
-  // 404 catch-all
-  app.all("*", (c) => c.json({
-    type: "error",
-    error: { type: "not_found_error", message: `${c.req.method} ${c.req.path} not found` }
-  }, 404))
+  app.all("*", (c) => c.json({ type: "error", error: { type: "not_found_error", message: `${c.req.method} ${c.req.path} not found` } }, 404))
 
   return { app, config: finalConfig }
 }
@@ -2144,64 +1152,22 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 export async function startProxyServer(config: Partial<ProxyConfig> = {}) {
   const { app, config: finalConfig } = createProxyServer(config)
 
-  const server = Bun.serve({
-    port: finalConfig.port,
-    hostname: finalConfig.host,
-    fetch: app.fetch,
-    idleTimeout: 0
-  })
+  const server = Bun.serve({ port: finalConfig.port, hostname: finalConfig.host, fetch: app.fetch, idleTimeout: 0 })
 
-  // Startup log with full configuration
-  logInfo("proxy.started", {
-    version: PROXY_VERSION,
-    host: finalConfig.host,
-    port: finalConfig.port,
-    stallTimeoutMs: finalConfig.stallTimeoutMs,
-    maxDurationMs: finalConfig.maxDurationMs,
-    maxOutputChars: finalConfig.maxOutputChars,
-    maxConcurrent: MAX_CONCURRENT,
-    queueTimeoutMs: QUEUE_TIMEOUT_MS,
-    claudeExecutable,
-    logDir: LOG_DIR,
-    debug: finalConfig.debug,
-    pid: process.pid,
-  })
-
+  logInfo("proxy.started", { version: PROXY_VERSION, host: finalConfig.host, port: finalConfig.port, stallTimeoutMs: finalConfig.stallTimeoutMs, maxDurationMs: finalConfig.maxDurationMs, maxOutputChars: finalConfig.maxOutputChars, maxConcurrent: MAX_CONCURRENT, queueTimeoutMs: QUEUE_TIMEOUT_MS, claudeExecutable, logDir: LOG_DIR, debug: finalConfig.debug, pid: process.pid })
   console.log(`Claude SDK Proxy v${PROXY_VERSION} running at http://${finalConfig.host}:${finalConfig.port}`)
   console.log(`  Logs: ${LOG_DIR}`)
   console.log(`  Debug: http://${finalConfig.host}:${finalConfig.port}/debug/stats`)
 
-  // Periodic health logging (every 5 minutes)
   const healthInterval = setInterval(() => {
     const mem = process.memoryUsage()
     const stats = traceStore.getStats()
-    logInfo("proxy.health", {
-      pid: process.pid,
-      rssBytes: mem.rss,
-      rssMB: +(mem.rss / 1024 / 1024).toFixed(1),
-      heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1),
-      heapTotalMB: +(mem.heapTotal / 1024 / 1024).toFixed(1),
-      externalMB: +(mem.external / 1024 / 1024).toFixed(1),
-      uptimeMs: stats.uptimeMs,
-      totalRequests: stats.requests.total,
-      totalErrors: stats.requests.errors,
-      activeRequests: stats.requests.active,
-      queueActive: requestQueue.activeCount,
-      queueWaiting: requestQueue.waitingCount,
-    })
-  }, 300_000) // 5 minutes
+    logInfo("proxy.health", { pid: process.pid, rssBytes: mem.rss, rssMB: +(mem.rss / 1024 / 1024).toFixed(1), heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1), heapTotalMB: +(mem.heapTotal / 1024 / 1024).toFixed(1), externalMB: +(mem.external / 1024 / 1024).toFixed(1), uptimeMs: stats.uptimeMs, totalRequests: stats.requests.total, totalErrors: stats.requests.errors, activeRequests: stats.requests.active, queueActive: requestQueue.activeCount, queueWaiting: requestQueue.waitingCount })
+  }, 300_000)
 
-  // Graceful shutdown
   const shutdown = (signal: string) => {
     const stats = traceStore.getStats()
-    logInfo("proxy.shutdown", {
-      signal,
-      pid: process.pid,
-      totalRequests: stats.requests.total,
-      totalErrors: stats.requests.errors,
-      activeRequests: stats.requests.active,
-      uptimeMs: stats.uptimeMs,
-    })
+    logInfo("proxy.shutdown", { signal, pid: process.pid, totalRequests: stats.requests.total, totalErrors: stats.requests.errors, activeRequests: stats.requests.active, uptimeMs: stats.uptimeMs })
     clearInterval(healthInterval)
     console.log(`\nReceived ${signal}, shutting down...`)
     server.stop(true)
