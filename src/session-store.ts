@@ -21,6 +21,8 @@ export interface SessionEntry {
   resumeCount: number
   /** Number of resume failures (fell back to full context) */
   failureCount: number
+  /** Number of context compactions survived */
+  compactionCount: number
 }
 
 export interface SessionStoreStats {
@@ -79,18 +81,20 @@ class SessionStore {
       model,
       resumeCount: existing?.resumeCount ?? 0,
       failureCount: existing?.failureCount ?? 0,
+      compactionCount: existing?.compactionCount ?? 0,
     })
     this.enforceMaxSessions()
     this.save()
   }
 
   /** Record a successful resume */
-  recordResume(conversationId: string, messageCount: number): void {
+  recordResume(conversationId: string, messageCount: number, wasCompacted?: boolean): void {
     const entry = this.sessions.get(conversationId)
     if (entry) {
       entry.resumeCount++
       entry.messageCount = messageCount
       entry.lastUsed = Date.now()
+      if (wasCompacted) entry.compactionCount = (entry.compactionCount ?? 0) + 1
       this.save()
     }
   }

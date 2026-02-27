@@ -672,13 +672,16 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
 
       let resumeSessionId: string | undefined
       let isResuming = false
+      let isCompacted = false
 
       if (conversationId) {
         const stored = sessionStore.get(conversationId)
         if (stored) {
-          if (messages.length < stored.messageCount) {
-            // Client reset detected: message count dropped
-            logInfo("session.reset_detected", {
+          const countDelta = messages.length - stored.messageCount
+
+          if (countDelta < 0 && messages.length <= 2) {
+            // Likely a /reset — invalidate stale SDK session, start fresh
+            logInfo("session.likely_reset", {
               reqId, conversationId, model,
               sdkSessionId: stored.sdkSessionId,
               storedMsgCount: stored.messageCount,
@@ -686,17 +689,27 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             })
             sessionStore.invalidate(conversationId)
           } else {
+            if (countDelta < 0) {
+              isCompacted = true
+              logInfo("session.compaction_detected", {
+                reqId, conversationId, model,
+                sdkSessionId: stored.sdkSessionId,
+                storedMsgCount: stored.messageCount,
+                currentMsgCount: messages.length,
+                dropped: -countDelta,
+              })
+            }
+
             resumeSessionId = stored.sdkSessionId
             isResuming = true
             logInfo("session.resuming", {
-              reqId,
-              conversationId,
-              model,
+              reqId, conversationId, model,
               storedModel: stored.model,
               sdkSessionId: resumeSessionId,
               storedMsgCount: stored.messageCount,
               currentMsgCount: messages.length,
               resumeCount: stored.resumeCount,
+              countDelta,
             })
           }
         }
@@ -892,7 +905,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           // Store session mapping for future resumption
           if (conversationId && capturedSessionId) {
             if (isResuming) {
-              sessionStore.recordResume(conversationId!, messages.length)
+              sessionStore.recordResume(conversationId!, messages.length, isCompacted)
               logInfo("session.resumed_ok", { reqId, conversationId, sdkSessionId: capturedSessionId })
             } else {
               sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
@@ -1134,6 +1147,8 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               let capturedSessionId: string | undefined
 
               // Helper to forward a stream event directly as SSE
+              // Track whether the current SDK content block was emitted (thinking blocks are skipped)
+              let currentBlockEmitted = false
               const forwardStreamEvent = (ev: any) => {
                 if (ev.type === "message_start" && ev.message?.usage) {
                   if (ev.message.usage.input_tokens) sdkInputTokens = ev.message.usage.input_tokens
@@ -1148,12 +1163,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   const cb = ev.content_block
                   if (cb?.type === "tool_use") {
                     toolCallCount++
+                    currentBlockEmitted = true
                     sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: cb.id, name: stripMcpPrefix(cb.name), input: {} } })
                   } else if (cb?.type === "text") {
+                    currentBlockEmitted = true
                     sse("content_block_start", { type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })
+                  } else {
+                    // Thinking or other block types — skip (don't emit SSE)
+                    currentBlockEmitted = false
                   }
-                  hasEmittedAnyBlock = true
+                  hasEmittedAnyBlock = hasEmittedAnyBlock || currentBlockEmitted
                 } else if (ev.type === "content_block_delta") {
+                  if (!currentBlockEmitted) return // Skip deltas for non-emitted blocks (thinking)
                   if (ev.delta?.type === "text_delta") {
                     fullText += ev.delta.text ?? ""
                     traceStore.updateOutput(reqId, fullText.length)
@@ -1163,6 +1184,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                     sse("content_block_delta", { type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: ev.delta.partial_json ?? "" } })
                   }
                 } else if (ev.type === "content_block_stop") {
+                  if (!currentBlockEmitted) return // Skip stop for non-emitted blocks (thinking)
                   sse("content_block_stop", { type: "content_block_stop", index: blockIdx })
                   blockIdx++
                 } else if (ev.type === "message_delta") {
@@ -1205,7 +1227,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 // Store session mapping
                 if (conversationId && capturedSessionId) {
                   if (isResuming) {
-                    sessionStore.recordResume(conversationId!, messages.length)
+                    sessionStore.recordResume(conversationId!, messages.length, isCompacted)
                   } else {
                     sessionStore.set(conversationId!, capturedSessionId, model, messages.length)
                   }
@@ -1365,7 +1387,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
               // Store session mapping
               if (conversationId && capturedSessionId2) {
                 if (isResuming) {
-                  sessionStore.recordResume(conversationId!, messages.length)
+                  sessionStore.recordResume(conversationId!, messages.length, isCompacted)
                 } else {
                   sessionStore.set(conversationId!, capturedSessionId2, model, messages.length)
                 }
